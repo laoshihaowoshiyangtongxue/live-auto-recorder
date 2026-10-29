@@ -1,0 +1,28 @@
+# 依赖与运行数据
+node_modules/
+logs/
+recordings/
+work/
+config.json
+config.json.*
+history.json
+history.json.*
+recording-jobs.json
+recording-jobs.json.*
+*.flv
+*.mp4
+*.jsonl
+*.ass
+*.log
+*.bak
+*.corrupt-*
+# 本机密钥与编辑器设置
+.env
+.env.*
+*.key
+*.pem
+.vscode/
+.idea/
+# 本地自动化结果
+tests/electron/*-results.json
+tests/electron/*-error.txt

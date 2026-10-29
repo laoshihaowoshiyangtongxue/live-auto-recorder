@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <title>直播自动录制</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="actionStatus" class="action-status" role="status" aria-live="polite" hidden></div>
+  <header>
+    <div class="brand">
+      <span class="dot"></span>
+      <h1>直播自动录制</h1>
+      <span id="postBadge" class="post-badge">后处理空闲 ▸</span>
+    </div>
+    <div class="header-actions">
+      <span id="diskInfo" class="disk"></span>
+      <button id="btnLog" class="ghost">日志</button>
+      <button id="btnOpenRec" class="ghost">录像目录</button>
+      <button id="btnSettings" class="ghost">设置</button>
+    </div>
+  </header>
+
+  <div id="layoutWorkspace" class="layout-workspace">
+  <div id="postPanel" class="post-strip" hidden>
+    <div class="layout-head"><strong>后处理</strong><div id="postUpdated" class="sub" role="status"></div><button id="layoutReset" class="mini">恢复默认布局</button><button id="postCollapse" class="mini">收起</button></div>
+    <div class="post-scroll">
+    <div id="postItems" class="post-items"></div>
+    <div id="postEmpty" class="sub" style="padding:2px 0">暂无任务（录制结束后自动烧录弹幕版）</div>
+    </div>
+  </div>
+  <div id="postSplit" class="layout-split" role="separator" tabindex="0" aria-orientation="horizontal" aria-label="调整后处理区域高度" title="拖动调整后处理区域高度，也可使用方向键" hidden></div>
+
+  <section class="addbar">
+    <div class="seg" id="addModeSeg" title="监测模式">
+      <button id="segFast" class="on">⚡ 秒级发现</button>
+      <button id="segProfile">👤 主页监控</button>
+    </div>
+    <input id="inpRid" placeholder="直播间链接 / 房间号（在播秒级触发录制）" />
+    <input id="inpName" placeholder="备注(留空=主播名)" />
+    <button id="btnAdd">+ 添加监控</button>
+    <button id="btnBatch" class="ghost">批量</button>
+    <button id="btnExport" class="ghost">导出</button>
+    <button id="btnLogin" class="ghost">扫码登录</button>
+    <span id="addMsg" class="msg"></span>
+  </section>
+
+  <main>
+    <div class="company-toolbar">
+      <h2>主播监控 <span id="companyTotals" class="sub"></span></h2>
+      <button id="companyCreate" class="primary">+ 新建公司</button>
+      <input id="companySearch" aria-label="搜索主播、房间号或公司" placeholder="搜索主播、房间号或公司" />
+      <select id="companyStatus" aria-label="按状态筛选"><option value="all">全部状态</option><option value="recording">录制中</option><option value="profile">主页监控</option><option value="warning">需要留意</option><option value="offline">离线</option></select>
+      <button id="companyCollapse">全部收起</button><button id="companyExpand">全部展开</button><button id="monitorCollapse" class="mini" aria-expanded="true">收起区域</button>
+    </div>
+    <div id="companyBulk" class="company-bulk" hidden><span id="companySelected"></span><button id="companyMoveSelected">移入公司</button><button id="companyClearSelected">取消选择</button></div>
+    <table id="tbl">
+      <thead>
+        <tr>
+          <th>主播</th><th>房间号</th><th>状态</th><th>直播标题</th>
+          <th>已录</th><th>文件</th><th>弹幕</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <div id="empty" class="empty" hidden>
+      <p>还没有监控任何主播</p>
+      <p class="hint">在上方输入直播间链接或房间号, 开播后会自动录制原画 + 弹幕</p>
+    </div>
+  </main>
+  <div id="historySplit" class="layout-split" role="separator" tabindex="0" aria-orientation="horizontal" aria-label="调整历史录制区域高度" title="拖动调整历史录制区域高度，也可使用方向键"></div>
+  <section id="historyPanel" class="history">
+    <div class="history-head">
+      <h3>历史录制 <span id="historyCount" class="sub"></span></h3>
+      <button id="btnClearHistory" class="mini ghost" hidden>清空</button>
+      <button id="historyCollapse" class="mini" aria-expanded="true">收起区域</button>
+    </div>
+    <table>
+      <thead>
+        <tr><th>时间</th><th>主播</th><th>标题</th><th>时长</th><th>文件</th></tr>
+      </thead>
+      <tbody id="historyBody"></tbody>
+    </table>
+    <div id="historyEmpty" class="empty small" hidden>还没有录过场次</div>
+  </section>
+  </div>
+
+  <div id="logPanel" class="log-panel" hidden>
+    <div class="log-head">
+      <h3>运行日志（最近200行，3秒刷新）</h3>
+      <button id="btnCloseLog" class="mini ghost">收起</button>
+    </div>
+    <pre id="logBox"></pre>
+  </div>
+
+  <div id="drawerBackdrop" class="drawer-backdrop" hidden></div>
+  <div id="batchModal" class="drawer" style="width:520px" hidden>
+    <h2>批量导入</h2>
+    <p class="hint">每行一个：链接或房间号，可用空格加备注。支持主页链接（离线主播自动转主页监控）。单次最多100个。</p>
+    <textarea id="batchText" rows="10" placeholder="https://live.douyin.com/123456789012 主播A&#10;https://www.douyin.com/user/MS4wLjA... 主播B&#10;623456789"></textarea>
+    <div id="batchResult" class="msg" style="white-space:pre-wrap"></div>
+    <div class="drawer-actions">
+      <button id="btnBatchGo" class="primary">开始导入</button>
+      <button id="btnBatchClose" class="ghost">关闭</button>
+    </div>
+  </div>
+  <div id="settingsPanel" class="drawer">
+    <h2>设置</h2>
+    <div class="settings-body">
+    <label>轮询间隔 <input id="setPoll" type="number" min="1" max="10" /> 秒（越小开播发现越快, 建议 2-3）</label>
+    <label>最大同时录制数 <input id="setMax" type="number" min="1" max="20" /></label>
+    <label>录制画质 <select id="setQuality">
+      <option value="highest">最高画质(原画)</option>
+      <option value="FULL_HD1">原画档</option>
+      <option value="HD1">蓝光</option>
+      <option value="SD1">超清</option>
+      <option value="SD2">高清</option>
+    </select>（该档不存在时自动向下回落）</label>
+    <label>保存路径 <input id="setOutDir" type="text" placeholder="recordings = 应用目录下(可填绝对路径)" /></label>
+    <label>磁盘最低剩余 <input id="setDisk" type="number" min="0" max="500" /> GB（低于即停止录制）</label>
+    <label>定时分段 <input id="setSeg" type="text" placeholder="90 = 分钟; 500MB = 按大小; 0 = 不分段" /></label>
+    <label>最小处理文件 <input id="setMinSize" type="number" min="0" max="100000" /> MB（小于此的分片跳过转封装/烧录, 过滤断流残片, 0=不过滤）</label>
+    <label>同时处理场数 <select id="setPostConc">
+      <option value="1">1 (串行, 最稳)</option>
+      <option value="2">2 (同时处理两场)</option>
+      <option value="3">3</option>
+      <option value="4">4</option>
+    </select>（多场同时烧录可大幅加快排队; 电脑负载高时调回 1）</label>
+    <label>录像保留 <input id="setKeep" type="number" min="0" max="3650" /> 天（0=永久保留）</label>
+    <label class="check"><input id="setBurn" type="checkbox" /> 录完自动烧录弹幕版（NVIDIA 显卡加速）</label>
+    <label class="check"><input id="setKeepRaw" type="checkbox" /> 保留无弹幕版（关闭可省一半磁盘, 弹幕jsonl仍在）</label>
+    <label class="check"><input id="setMerge" type="checkbox" /> 多段自动拼接为单文件（断流重连/定时分段的分片最终拼回一个视频）</label>
+    <label class="check"><input id="setPostQuiet" type="checkbox" /> 启用后处理静音时段</label>
+    <label>每天静音开始 <input id="setPostQuietStart" type="time" step="60" /></label>
+    <label>每天静音结束 <input id="setPostQuietEnd" type="time" step="60" /></label>
+    <p class="hint">按电脑本地时间，可跨午夜。时段内不启动新的修复、合并或弹幕烧录任务；已开始的任务完整跑完。录制和弹幕采集继续，结束后自动处理排队任务。</p>
+    <label class="check"><input id="setNoSleep" type="checkbox" /> 录制期间阻止系统休眠</label>
+    <label class="check"><input id="setAutoStart" type="checkbox" /> 开机自动启动</label>
+    <label>Webhook 通知 <input id="setWebhook" type="text" placeholder="https://公网地址/钩子 (开播/录完时POST)" /></label>
+    <p class="hint">存储预估：原画约 2-4 GB/小时·路，含弹幕版（转码后约为原画的3~4.5倍）；建议开启保留天数清理</p>
+    </div>
+    <div class="drawer-actions">
+      <button id="btnSaveSettings" class="primary">保存</button>
+      <button id="btnCloseSettings" class="ghost">取消</button>
+    </div>
+  </div>
+
+  <dialog id="roomConfigDialog" class="room-dialog">
+    <form id="roomConfigForm">
+      <h2 id="roomConfigTitle">主播设置</h2>
+      <label>标题过滤（正则，留空全录）<input id="roomFilter" type="text" maxlength="100" /></label>
+      <label>值守时段（留空全天）<input id="roomHours" type="text" placeholder="19:00-23:00" maxlength="20" /></label>
+      <p id="roomConfigError" class="msg" role="alert"></p>
+      <div class="drawer-actions">
+        <button id="roomConfigSave" type="submit" class="primary">保存</button>
+        <button id="roomConfigCancel" type="button" class="ghost">取消</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="recordingsDialog" class="room-dialog recordings-dialog">
+    <div class="recordings-head"><h2>录像目录</h2><button id="recordingsClose" type="button">关闭</button></div>
+    <p id="recordingsPath" class="recordings-path"></p>
+    <div class="recordings-head">
+      <button id="recordingsUp" type="button">上一级</button>
+      <button id="recordingsRefresh" type="button">刷新</button>
+      <button id="recordingsCopy" type="button">复制目录路径</button>
+      <button id="recordingsSystem" type="button">系统文件管理器</button>
+    </div>
+    <p id="recordingsStatus" role="status" aria-live="polite"></p>
+    <div id="recordingsEntries" class="recordings-entries"></div>
+  </dialog>
+  <footer>关闭窗口 = 后台继续录制 · 退出请用托盘图标 → 退出</footer>
+  <dialog id="companyDialog" class="company-dialog" aria-labelledby="companyDialogTitle">
+    <form id="companyForm"><h2 id="companyDialogTitle"></h2>
+      <label id="companyNameLabel">公司名称<input id="companyName" maxlength="60" autocomplete="off" /></label>
+      <label id="companyTargetLabel">所属公司<select id="companyTarget"></select></label>
+      <p id="companyDialogHint" class="sub"></p><p id="companyDialogError" role="alert"></p>
+      <div class="company-dialog-actions"><button type="button" id="companyCancel">取消</button><button type="submit" id="companySave" class="primary">保存</button></div>
+    </form>
+  </dialog>
+  <script src="companies.js"></script>
+  <script src="layout.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
