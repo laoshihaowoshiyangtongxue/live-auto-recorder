@@ -31,7 +31,9 @@ function pickFlv(flv, prefer) {
 
 // 统一房间信息: { platform, rid, live, status, title, nickname, flv{档位:url}, hls, best }
 function normalizeEnter(json, rid) {
-  const d0 = json?.data?.data?.[0] || {};
+  const d0 = json?.data?.data?.[0];
+  // An incomplete response is not evidence that a recording has ended.
+  if(!d0||!Number.isInteger(d0.status)||d0.status<1)throw new Error('直播状态缺失或无效，稍后重新检查');
   const su = d0.stream_url || {};
   const flv = { ...(su.flv_pull_url || {}) };
   return {

@@ -6,6 +6,21 @@ function component(value,fallback){
   return cleaned||fallback;
 }
 function shorten(value,limit){let result='';for(const ch of value){if(result.length+ch.length>limit)break;result+=ch;}return result;}
+function chineseNumber(value){
+  if(!Number.isInteger(value)||value<1||value>100000)throw Error('录像分段序号无效');
+  const digits='零一二三四五六七八九',units=['','十','百','千'];
+  function group(n){let out='',zero=false;for(let i=3;i>=0;i--){const digit=Math.floor(n/10**i)%10;if(digit){if(zero&&out)out+='零';out+=digits[digit]+units[i];zero=false;}else if(out)zero=true;}return out;}
+  const high=Math.floor(value/10000),low=value%10000;
+  const text=high?group(high)+'万'+(low&&low<1000?'零':'')+(low?group(low):''):group(low);
+  return text.replace(/^一十/,'十');
+}
+function splitLabel(index,total){
+  if(!Number.isInteger(index)||!Number.isInteger(total)||index<1||index>total||total>100000)throw Error('录像拆分顺序无效');
+  if(total===1)return '';
+  if(total===2)return ['上','下'][index-1];
+  if(total===3)return ['上','中','下'][index-1];
+  return '第'+chineseNumber(index)+'部分';
+}
 function identity(file){const s=fs.statSync(file);if(!s.isFile())throw Error('录像路径不是普通文件');return {ino:s.ino,dev:s.dev,size:s.size};}
 function matches(file,expected){const actual=identity(file);return ['ino','dev','size'].every(k=>actual[k]===expected[k]);}
 function startStamp(rec){
@@ -25,7 +40,7 @@ function stamp(rec,job){
   return endDate>start.date&&Number(fields.hour)<9?{...start,date:endDate+'凌晨'}:morningStart;
 }
 function makePlan(rec,job){
-  const directory=path.dirname(rec.base),{date,time}=stamp(rec,job);
+  const sourceDirectory=path.dirname(rec.base),{date,time}=stamp(rec,job),directory=path.join(sourceDirectory,date);
   const nickname=shorten(component(job.nickname,'直播间'),48),topic=component(job.title,'未命名主题');
   const sources=[];
   for(let part=1;part<=rec.part;part++)for(const [kind,source] of [['纯享版',rec.mp4Path(part)],['弹幕版',rec.burnOutPath(part)]])if(fs.existsSync(source)){
@@ -34,7 +49,7 @@ function makePlan(rec,job){
       const {identity:splitIdentity,LIMIT}=require('./upload-split');
       if(split.sourceIdentity!==splitIdentity(source)||!split.parts?.length)throw Error('超大原录像已改变，无法发布拆分结果');
       for(const [index,piece] of split.parts.entries()){
-        if(!piece.file.startsWith(source+'.split-')||path.dirname(piece.file)!==directory||!fs.existsSync(piece.file)||splitIdentity(piece.file)!==piece.identity||fs.statSync(piece.file).size>=LIMIT)throw Error('拆分录像已改变或过大，原文件已保留');
+        if(!piece.file.startsWith(source+'.split-')||path.dirname(piece.file)!==sourceDirectory||!fs.existsSync(piece.file)||splitIdentity(piece.file)!==piece.identity||fs.statSync(piece.file).size>=LIMIT)throw Error('拆分录像已改变或过大，原文件已保留');
         sources.push({source:piece.file,kind,part,splitIndex:index+1,splitTotal:split.parts.length,identity:identity(piece.file)});
       }
     } else sources.push({source,kind,part,identity:identity(source)});
@@ -43,7 +58,8 @@ function makePlan(rec,job){
   for(let serial=1;serial<10000;serial++){
     const counter=serial===1?'':`_${serial}`;
     const entries=sources.map(entry=>{
-      const prefix=`${date}_${nickname}_${time}_`,tail=`${rec.part>1?'_分段'+String(entry.part).padStart(2,'0'):''}${entry.splitTotal?'_上传分段'+String(entry.splitIndex).padStart(3,'0'):''}${counter}_${entry.kind}.mp4`;
+      const label=entry.splitTotal?splitLabel(entry.splitIndex,entry.splitTotal):'';
+      const prefix=`${date}_${nickname}_${time}_`,tail=`${rec.part>1?'_分段'+String(entry.part).padStart(2,'0'):''}${label?'_'+label:''}${counter}_${entry.kind}.mp4`;
       const available=Math.min(100,240-directory.length-1-prefix.length-tail.length);
       if(available<1)throw Error('录像保存路径过长，原文件保留，请缩短保存路径');
       const topicPart=shorten(topic,available).replace(/[. ]+$/g,'')||shorten('主题',available);
@@ -55,11 +71,22 @@ function makePlan(rec,job){
 }
 function applyPlan(rec,entries,{renameFinal=false}={}){
   try {
+  const baseDir=path.resolve(path.dirname(rec.base));
+  const allowedFinal=file=>{
+    const resolved=path.resolve(file),parent=path.dirname(resolved),name=path.basename(resolved),date=/^(\d{4}-\d{2}-\d{2}(?:凌晨)?)_/.exec(name)?.[1];
+    return isFinalVideoName(name)&&(parent===baseDir||(date&&parent===path.join(baseDir,date)));
+  };
   const allowed=new Set();for(let i=1;i<=rec.part;i++){allowed.add(path.resolve(rec.mp4Path(i)));allowed.add(path.resolve(rec.burnOutPath(i)));}
   for(const split of Object.values(rec.uploadParts||{}))for(const piece of split.parts||[])if(typeof piece.file==='string'&&piece.file.startsWith(split.source+'.split-')&&path.dirname(path.resolve(piece.file))===path.dirname(path.resolve(rec.base)))allowed.add(path.resolve(piece.file));
   for(const entry of entries){
-    const finalSource=renameFinal&&path.dirname(path.resolve(entry.source))===path.dirname(path.resolve(rec.base))&&isFinalVideoName(path.basename(entry.source));
-    if((!allowed.has(path.resolve(entry.source))&&!finalSource)||path.dirname(path.resolve(entry.destination))!==path.dirname(path.resolve(rec.base))||!/_((纯享版)|(弹幕版))\.mp4$/.test(entry.destination))throw Error('录像命名计划路径无效，原文件已保留');
+    const finalSource=renameFinal&&allowedFinal(entry.source);
+    if((!allowed.has(path.resolve(entry.source))&&!finalSource)||!allowedFinal(entry.destination))throw Error('录像命名计划路径无效，原文件已保留');
+    if(finalSource&&path.dirname(path.resolve(entry.source))!==baseDir&&fs.existsSync(entry.source)){const stat=fs.lstatSync(path.dirname(path.resolve(entry.source)));if(!stat.isDirectory()||stat.isSymbolicLink())throw Error('录像日期目录不安全，原文件已保留');}
+    const destDir=path.dirname(path.resolve(entry.destination));
+    if(destDir!==baseDir){
+      fs.mkdirSync(destDir,{recursive:true});const stat=fs.lstatSync(destDir);
+      if(!stat.isDirectory()||stat.isSymbolicLink())throw Error('录像日期目录不安全，原文件已保留');
+    }
     if(fs.existsSync(entry.destination)){
       if(!matches(entry.destination,entry.identity))throw Error('目标录像已存在，未覆盖任何文件');
       if(fs.existsSync(entry.source)){
@@ -69,7 +96,7 @@ function applyPlan(rec,entries,{renameFinal=false}={}){
       continue;
     }
     if(!fs.existsSync(entry.source)||!matches(entry.source,entry.identity))throw Error('待命名录像已变化或缺失，保留现有文件');
-    // Same-folder hard links create the destination atomically without ever
+    // Same-volume hard links create the destination atomically without ever
     // replacing an unrelated file. A crash before unlink is safe to resume.
     fs.linkSync(entry.source,entry.destination);
     fs.unlinkSync(entry.source);
@@ -117,8 +144,11 @@ function isFinalVideoName(name){return /^\d{4}-\d{2}-\d{2}(?:凌晨)?_.+_\d{2}-\
 function dateMigration(rec,job){
   if(job.namingMigrationPlan?.length)return job.namingMigrationPlan;
   const date=stamp(rec,job).date;
-  const changed=(job.publicationPlan||[]).filter(e=>fs.existsSync(e.destination)&&isFinalVideoName(path.basename(e.destination))).map(e=>({source:e.destination,destination:path.join(path.dirname(e.destination),path.basename(e.destination).replace(/^\d{4}-\d{2}-\d{2}(?:凌晨)?/,date)),identity:identity(e.destination)})).filter(e=>e.source!==e.destination);
+  const changed=(job.publicationPlan||[]).filter(e=>fs.existsSync(e.destination)&&isFinalVideoName(path.basename(e.destination))).map(e=>{
+    const parent=path.dirname(e.destination),baseDir=path.dirname(rec.base),destDir=path.resolve(parent)===path.resolve(baseDir)?parent:path.join(baseDir,date);
+    return {source:e.destination,destination:path.join(destDir,path.basename(e.destination).replace(/^\d{4}-\d{2}-\d{2}(?:凌晨)?/,date)),identity:identity(e.destination)};
+  }).filter(e=>e.source!==e.destination);
   for(const entry of changed)if(fs.existsSync(entry.destination)&&!matches(entry.destination,entry.identity))throw Error('新的凌晨命名已被其他文件占用，保留原文件');
   return changed;
 }
-module.exports={makePlan,applyPlan,makeArchivePlan,applyArchivePlan,videoFiles,isFinalVideoName,stamp,dateMigration};
+module.exports={makePlan,applyPlan,makeArchivePlan,applyArchivePlan,videoFiles,isFinalVideoName,stamp,dateMigration,splitLabel};

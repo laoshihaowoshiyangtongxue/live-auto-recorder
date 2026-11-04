@@ -335,6 +335,14 @@ test('retention includes room folders and protects active, pending and backup fi
   assert.equal(fs.existsSync(old),false);
   for(const file of [active,pending,raw,saved])assert.equal(fs.existsSync(file),true,file);
 });
+test('retention handles dated recordings while preserving unfinished and unrelated files',()=>{
+ const s=scheduler();s.outDir=path.join(root,'retention-dates');fs.mkdirSync(s.outDir);s.cfg.settings.keepDays=1;
+ const room=roomDirectory(s.outDir,'123456','主播'),dir=path.join(room,'2026-10-27凌晨');fs.mkdirSync(dir);
+ const old=path.join(dir,'2026-10-27凌晨_主播_23-00-00_测试_纯享版.mp4'),unfinished=path.join(dir,'2026-10-27凌晨_主播_23-00-00_测试_弹幕版.mp4'),other=path.join(dir,'用户视频.mp4');
+ for(const f of [old,unfinished,other]){fs.writeFileSync(f,'fixture');fs.utimesSync(f,new Date(0),new Date(0));}
+ s.recovery={bases:()=>[],store:{jobs:new Map([['job',{status:'publishing',publicationPlan:[{destination:unfinished}]}]])}};s._cleanupOld();
+ assert.equal(fs.existsSync(old),false);assert.equal(fs.existsSync(unfinished),true);assert.equal(fs.existsSync(other),true);
+});
 
 test('classified recording seals raw and subtitle versions in the same room directory', async () => {
   const s=scheduler(),t=task();s.outDir=path.join(root,'classified-session');fs.mkdirSync(s.outDir);
@@ -472,6 +480,7 @@ test('damaged frame payload is rebuilt without discarding the rest of the record
 
 test('a repair with substantial video loss is rejected', async () => {
   const rec=new Recorder(path.join(root,'lossy-repair'));const pending=rec.mp4Path(1)+'.pending.mp4';
+  rec._sizeOf=()=>100000;
   rec._scanVideo=async file=>({packets:Array(file===pending?50:100),duration:10});
   rec._runFfmpeg=async()=>{fs.writeFileSync(pending,Buffer.alloc(2048));return {code:0};};
   rec.validateMedia=async()=>({ok:true});
@@ -490,10 +499,11 @@ test('a failed destination replacement preserves both old destination and raw so
   const rec = new Recorder(path.join(root, 'publish-failure')); rec.part = 1; await clip(rec, 1, 0, 2);
   fs.writeFileSync(rec.mp4Path(1), 'existing destination');
   fs.writeFileSync(rec.mp4Path(1) + '.previous', 'unrecovered backup');
-  await rec.remuxAll(0);
+  await assert.rejects(rec.remuxAll(0),e=>e.code==='LR_SOURCE_BUSY');
   assert.equal(fs.existsSync(rec.flvPath(1)), true);
   assert.equal(fs.readFileSync(rec.mp4Path(1), 'utf8'), 'existing destination');
   assert.equal(fs.readFileSync(rec.mp4Path(1) + '.previous', 'utf8'), 'unrecovered backup');
+  assert.ok(fs.existsSync(rec.mp4Path(1) + '.pending.mp4'));
 });
 test('failed merge preserves source files and the original segment timeline', async () => {
   const rec = new Recorder(path.join(root, 'merge-failure')); rec.part = 2; rec.partStarts = [0, 1000, 4000];

@@ -320,7 +320,7 @@ function renderPost() {
     // 全 textContent 构建(v.name 来自主播昵称, 远端可控)
     const dot = document.createElement('span'); dot.className = 'pi-dot ' + dotCls;
     const nm = document.createElement('span'); nm.className = 'pi-name'; nm.textContent = (v.queuePosition?'#'+v.queuePosition+' ':'')+(v.name || ''); nm.title = [v.error,v.title,v.startedAt?new Date(v.startedAt).toLocaleString('zh-CN'):null].filter(Boolean).join('\n');
-    const lb = document.createElement('span'); lb.className = 'pi-label'; lb.textContent = label;
+    const lb = document.createElement('span'); lb.className = 'pi-label'; lb.textContent = label; lb.title = label;
     const bar = document.createElement('div'); bar.className = 'pi-bar' + (running && !known ? ' indeterminate' : '');
     bar.setAttribute('role', 'progressbar'); bar.setAttribute('aria-label', (v.name || '') + ' ' + label);
     bar.setAttribute('aria-valuemin', '0'); bar.setAttribute('aria-valuemax', '100');
@@ -338,7 +338,7 @@ function renderPost() {
         const remaining = Math.max(1, Math.ceil(progress.remainingSec - (Date.now() - progress.updatedAt) / 1000));
         const finish = new Date(progress.updatedAt + progress.remainingSec * 1000);
         const clock = finish.toLocaleTimeString('zh-CN', { hour12: false, hour:'2-digit', minute:'2-digit', second:'2-digit' });
-        eta.textContent = `本阶段约剩${remaining >= 60 ? Math.ceil(remaining / 60) + '分钟' : remaining + '秒'} · 预计 ${clock} 完成`;
+        eta.textContent = `本阶段约剩${remaining >= 60 ? Math.ceil(remaining / 60) + '分钟' : remaining + '秒'} · 预计 ${clock} 本阶段结束`;
       } else eta.textContent = known && pct >= 99 ? '正在收尾，预计时间更新中' : '预计完成时间：正在估算';
       eta.title = '按当前阶段的实际处理速度估算，后续阶段会重新计算；并非整场双版本全部完成时间。';
       row.appendChild(eta);

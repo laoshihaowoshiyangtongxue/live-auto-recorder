@@ -5,7 +5,10 @@ const path = require('node:path');
 const {randomUUID}=require('node:crypto');
 const log = require('../util/log');
 const {isHumanComment}=require('./danmaku');
-const {splitRecorder}=require('./upload-split');
+const {splitRecorder,identity}=require('./upload-split');
+const {findCommentBackup}=require('./capture-protection');
+function fileIdentity(file){try{return identity(file);}catch{return null;}}
+function sameContentIdentity(a,b){return typeof a==='string'&&typeof b==='string'&&a.split(':').length===5&&b.split(':').length===5&&a.split(':').slice(0,4).join(':')===b.split(':').slice(0,4).join(':');}
 
 // ASS 坐标系固定 1088x1920, libass 会自动缩放到实际视频尺寸
 const PLAY_W = 1088;
@@ -20,7 +23,7 @@ function fmtAssTime(sec) {
 
 function textWidth(text, fsz) {
   let w = 0;
-  for (const ch of text) w += /[\u2E80-\u9FFF\uF900-\uFAFF\uFF00-\uFFEF]/.test(ch) ? fsz : fsz * 0.56;
+  for (const ch of text) {const c=ch.codePointAt(0);w+=(c>=0x2e80&&c<=0x9fff||c>=0xf900&&c<=0xfaff||c>=0xff00&&c<=0xffef)?fsz:fsz*0.56;}
   return w;
 }
 
@@ -32,6 +35,48 @@ function commentText(entry) {
   // list snapshot. Their message boundaries cannot be recovered reliably.
   if(/[^\s：:]{0,30}\*{3,}[^\s：:]{0,15}[：:]/.test(body))return '';
   return body;
+}
+
+// Precompute the elapsed durations once for a merged recording. A binary
+// search is safe only for ordered, numeric segment starts; unusual recovery
+// records retain the original linear calculation exactly.
+function createTimelineMapper(partT0,segDurs,segStarts,replayOffsets){
+  if(!(segDurs&&segStarts&&segDurs.length>1))return t=>(t-partT0)/1000;
+  let ordered=Array.isArray(segStarts)&&segStarts.length>0;
+  if(ordered)for(let i=0;i<segStarts.length;i++)if(!Number.isFinite(segStarts[i])||(i&&segStarts[i]<segStarts[i-1])){ordered=false;break;}
+  const numeric=Array.isArray(segDurs)&&segDurs.every(Number.isFinite);
+  let prefix=null;
+  if(ordered&&numeric){prefix=[0];for(let i=0;i<segStarts.length;i++)prefix.push(prefix[i]+(segDurs[i]||0));}
+  return tMs=>{
+    let seg=segStarts.length-1;
+    if(prefix){let lo=0,hi=segStarts.length;while(lo<hi){const mid=(lo+hi)>>>1;if(tMs<segStarts[mid])hi=mid;else lo=mid+1;}seg=lo-1;}
+    else for(let i=0;i<segStarts.length;i++){if(tMs<segStarts[i]){seg=i-1;break;}}
+    if(seg<0)seg=0;
+    let before=0;if(prefix)before=prefix[seg];else for(let i=0;i<seg;i++)before+=segDurs[i]||0;
+    const replayOffset=(replayOffsets&&replayOffsets[seg])||0;
+    const within=Math.min((tMs-segStarts[seg])/1000+replayOffset,segDurs[seg]||Infinity);
+    return before+Math.max(0,within);
+  };
+}
+
+// Assign each comment once when part boundaries are ordered. Keep the old
+// per-part filter for damaged or incomplete boundary records, where ranges
+// may overlap and a comment may legitimately be selected more than once.
+function partitionComments(entries,partStarts,startedAt,parts){
+  if(parts<=1||!Array.isArray(partStarts))return null;
+  const starts=[];
+  for(let part=1;part<=parts;part++){
+    const start=partStarts[part]||startedAt;
+    if(!Number.isFinite(start)||(part>1&&(!partStarts[part]||start<starts[part-2])))return null;
+    starts.push(start);
+  }
+  const buckets=Array.from({length:parts},()=>[]);
+  for(const entry of entries){
+    let lo=0,hi=starts.length;
+    while(lo<hi){const mid=(lo+hi)>>>1;if(entry.t<starts[mid])hi=mid;else lo=mid+1;}
+    if(lo)buckets[lo-1].push(entry);
+  }
+  return buckets;
 }
 
 function genAss(entries) {
@@ -271,22 +316,30 @@ class PostProcessor {
   close(){clearInterval(this.watchdog);}
 
   async _process(job, lane) {
-    const { recorder, danmakuFile, nickname } = job;
+    const { recorder, nickname } = job;let {danmakuFile}=job;
     const settings = job.settings || this.s;
     if (!settings.burnDanmaku) {if(typeof recorder.mp4Path==='function')await splitRecorder(recorder);return { skipped: true };}
     if (job.paused) throw new PauseSignal();
     await recorder.recoverPublications?.();
     if (job.paused) throw new PauseSignal();
-    let entries = [];
+    if(!fs.existsSync(danmakuFile)){
+      const backup=await findCommentBackup(recorder.base);
+      if(backup){danmakuFile=backup;recorder.notices ||= [];const notice='弹幕原文件缺失，已使用核验通过的弹幕备份';if(!recorder.notices.includes(notice))recorder.notices.push(notice);}
+    }
+    let entries = [],commentProof=null;
     try {
       let invalid=0,filtered=0;
-      for(const line of fs.readFileSync(danmakuFile,'utf8').split('\n').filter(l=>l.trim())){
+      const before=fileIdentity(danmakuFile),content=fs.readFileSync(danmakuFile,'utf8');
+      if(!before||before!==fileIdentity(danmakuFile)){const e=Error('弹幕数据读取期间发生变化，保留原片等待重新读取');e.code='LR_SOURCE_BUSY';throw e;}
+      commentProof={identity:before,hash:require('node:crypto').createHash('sha256').update(content).digest('hex')};
+      for(const line of content.split('\n').filter(l=>l.trim())){
         try{const e=JSON.parse(line);if(!e||!Number.isFinite(Number(e.t))||typeof e.text!=='string')throw Error('invalid comment');if(!commentText(e).trim()){filtered++;continue;}entries.push({...e,t:Number(e.t)});}
         catch{invalid++;}
       }
       if(invalid){const notice=`已跳过${invalid}条损坏弹幕记录，其余弹幕继续处理，原数据已保留`;recorder.notices=recorder.notices||[];if(!recorder.notices.includes(notice))recorder.notices.push(notice);log.warn('[post]',notice);}
       if(filtered){const notice=`已过滤${filtered}条系统通知或多消息混合记录，原始弹幕文件已保留`;recorder.notices=recorder.notices||[];if(!recorder.notices.includes(notice))recorder.notices.push(notice);log.warn('[post]',notice);}
     } catch(e) {
+      if(e.code==='LR_SOURCE_BUSY')throw e;
       if(e.code!=='ENOENT')throw new Error('弹幕文件读取失败，原录像已保留: '+e.message);
       const notice='本场没有保存到弹幕数据，弹幕版保留完整画面';recorder.issues=recorder.issues||[];if(!recorder.issues.includes(notice))recorder.issues.push(notice);log.warn('[post]',notice);
     }
@@ -295,6 +348,7 @@ class PostProcessor {
     if (!job.mergeComplete && settings.autoPartMerge && recorder.part > 1 && !(recorder.issues && recorder.issues.length)) {
       try { await recorder.consolidateMp4s(); } catch (e) { log.warn('[post] MP4兜底合并异常(按原分片处理)', e && e.message); }
     }
+    const partComments=partitionComments(entries,recorder.partStarts,recorder.startedAt,recorder.part);
     let burned = 0;
     // 使用任务唯一字幕路径；完成顺序变化、暂停或调整并发数都不会覆盖其他任务。
     const laneAss = 'dm_task_'+randomUUID()+'.ass';
@@ -305,17 +359,36 @@ class PostProcessor {
       if (job.paused) throw new PauseSignal(); // 分片边界暂停点(运行中暂停经 ffmpeg 中止也会落到这里)
       const mp4 = recorder.mp4Path(part);
       const burnt=recorder.burnOutPath(part);
+      const inputIdentity=fileIdentity(mp4),currentTimeline=()=>JSON.stringify([1,part,recorder.startedAt,recorder.partStarts,recorder.mergedDurations,recorder.mergedSegStarts,recorder.mergedReplayOffsets]),timeline=currentTimeline();
+      const proof=recorder.burnProofs?.[part],outputIdentity=fileIdentity(burnt);
+      const proofMatches=()=>!!(proof&&inputIdentity&&outputIdentity&&commentProof&&proof.input===inputIdentity&&proof.output===outputIdentity&&proof.comments===commentProof.hash&&proof.timeline===timeline&&fileIdentity(mp4)===inputIdentity&&fileIdentity(burnt)===outputIdentity&&fileIdentity(danmakuFile)===commentProof.identity);
       let dataTime=0;try{dataTime=fs.statSync(danmakuFile).mtimeMs;}catch{}
-      if(fs.existsSync(burnt)&&fs.statSync(burnt).mtimeMs>=dataTime){
-        const checked=await recorder.validateMedia(burnt);
+      let inputTime=0;try{inputTime=fs.statSync(mp4).mtimeMs;}catch{}
+      const contextMatches=!recorder.burnDirtyParts?.[part]&&(!proof||(proof.timeline===timeline&&(!commentProof||proof.comments===commentProof.hash)
+        &&(sameContentIdentity(proof.input,inputIdentity)||(!inputIdentity&&!settings.keepRaw))
+        &&sameContentIdentity(proof.output,outputIdentity)));
+      if(fs.existsSync(burnt)&&contextMatches&&(proof||fs.statSync(burnt).mtimeMs>=Math.max(dataTime,inputTime))){
+        const reused=proofMatches();const checked=reused?{ok:true}:await recorder.validateMedia(burnt);
+        if(checked.retryable){const e=Error('弹幕成品暂无法完成校验，保留现有文件等待重新检查: '+String(checked.stderr||''));e.code='LR_SOURCE_BUSY';throw e;}
         const duration=fs.existsSync(mp4)?await recorder._probeDuration(mp4):0;
         const outDuration=checked.ok?await recorder._probeDuration(burnt):0;
-        if(checked.ok&&outDuration>0&&(!duration||Math.abs(duration-outDuration)<=1)){
+        const stable=fileIdentity(mp4)===inputIdentity&&fileIdentity(burnt)===outputIdentity&&(!commentProof||fileIdentity(danmakuFile)===commentProof.identity);
+        if(checked.ok&&!stable){const e=Error('检查期间文件发生变化，保留弹幕成品等待重新检查');e.code='LR_SOURCE_BUSY';throw e;}
+        if(checked.ok&&(outDuration<=0||(inputIdentity&&duration<=0))){const e=Error('录像时长暂时无法确认，保留现有成品等待重新检查');e.code='LR_SOURCE_BUSY';throw e;}
+        if(checked.ok&&stable&&(!reused||proofMatches())&&outDuration>0&&(!duration||Math.abs(duration-outDuration)<=1)){
+          if(!inputIdentity&&settings.keepRaw&&!recorder.emptyParts?.has(part)){
+            const issue=`分片${part}原片缺失，不能确认双版本完整`;recorder.issues=recorder.issues||[];if(!recorder.issues.includes(issue))recorder.issues.push(issue);
+          }
+          if(proof&&commentProof&&inputIdentity&&outputIdentity&&recorder._validatedFiles?.get(burnt)===outputIdentity){
+            recorder.burnProofs[part]={input:inputIdentity,output:outputIdentity,comments:commentProof.hash,timeline};
+          }
           burned++;if(job.view){job.view.partsDone=part;job.view.partPct=100;}
+          if(recorder.checkpoint?.()===false){const e=Error('弹幕成品状态暂未保存，原片已保留');e.code='LR_SOURCE_BUSY';throw e;}
           if(!settings.keepRaw&&fs.existsSync(mp4))fs.unlinkSync(mp4);
-          recorder.checkpoint?.();continue;
+          continue;
         }
       }
+      if((proof||recorder.burnDirtyParts?.[part])&&!commentProof&&fs.existsSync(burnt))throw Error('弹幕数据缺失，已保留现有弹幕版等待检查');
       if (!fs.existsSync(mp4)) {
         if(!recorder.emptyParts?.has(part)){
           const issue=`分片${part}原片缺失，不能确认双版本完整`;recorder.issues=recorder.issues||[];
@@ -323,6 +396,7 @@ class PostProcessor {
         }
         continue;
       }
+      if(!inputIdentity){const e=Error('弹幕原片暂时无法确认身份，等待重新检查');e.code='LR_SOURCE_BUSY';throw e;}
       const minMB = +settings.minSizeMB || 0;
       if (minMB > 0 && fs.statSync(mp4).size < minMB * 1048576) {
         log.warn(`[post] 分片${part}小于最小处理文件${minMB}MB, 跳过烧录`);
@@ -335,45 +409,52 @@ class PostProcessor {
       // 例: 录1分钟→暂停2分钟→恢复, 恢复后的弹幕落在视频 1:00 而非 3:00
       const segDurs = recorder.mergedDurations || null;
       const segStarts = recorder.mergedSegStarts || null;
-      const merged = recorder.part === 1 && segDurs && segStarts && segDurs.length > 1;
-      const remap = (tMs) => {
-        if (!merged) return (tMs - partT0) / 1000;
-        let seg = segStarts.length - 1;
-        for (let i = 0; i < segStarts.length; i++) { if (tMs < segStarts[i]) { seg = i - 1; break; } }
-        if (seg < 0) seg = 0;
-        let before = 0;
-        for (let i = 0; i < seg; i++) before += segDurs[i] || 0;
-        // 段内位置封顶到该段视频时长: 暂停/断流间隙收到的弹幕归到前段末尾, 不越界
-        const replayOffset = (recorder.mergedReplayOffsets && recorder.mergedReplayOffsets[seg]) || 0;
-        const within = Math.min((tMs - segStarts[seg]) / 1000 + replayOffset, segDurs[seg] || Infinity);
-        return before + Math.max(0, within);
-      };
-      const partEntries = entries
-        .filter((e) => e.t >= partT0 && e.t < partT1)
+      const remap=createTimelineMapper(partT0,recorder.part===1?segDurs:null,segStarts,recorder.mergedReplayOffsets);
+      const partEntries = (partComments?partComments[part-1]:entries.filter((e) => e.t >= partT0 && e.t < partT1))
         .map((e) => ({ ...e, vt: remap(e.t) }));
       if (!partEntries.length) {
         log.info(`[post] 分片${part}无弹幕, 仍生成完整弹幕版文件`);
       }
       const resuming=recorder.burnCheckpoint?.part===part&&fs.existsSync(burnt+'.pending.mp4');
-      recorder.assertSpace?.(resuming?0:Math.max(64*1024**2,fs.statSync(mp4).size*4),resuming?'恢复弹幕检查':'准备弹幕烧录');
+      recorder.assertSpace?.(resuming?0:Math.max(64*1024**2,fs.statSync(mp4).size*(partEntries.length?4:1.2)),resuming?'恢复弹幕检查':'准备弹幕烧录');
       fs.writeFileSync(laneAssPath, genAss(partEntries), 'utf8');
+      // Journal that this output must not be reused until its input and comment
+      // snapshot have both been checked after the encoder finishes.
+      recorder.burnDirtyParts ||= {};recorder.burnDirtyParts[part]=true;
+      if(recorder.checkpoint?.()===false){const e=Error('弹幕处理状态暂未保存，原片已保留');e.code='LR_SOURCE_BUSY';throw e;}
       // Progress comes from the encoder's media clock, never file size.
       if (job.view) {
         job.view.partIdx = part;
         job.view.partPct = 0;
       }
-      const r = await recorder.burnPartDanmaku(part, laneAss);
+      const r = await recorder.burnPartDanmaku(part, laneAss,{noComments:partEntries.length===0});
       if(job.canceled||job.exitDeferred)throw new Error('任务已停止');
-      if (job.view) {
-        job.view.partsDone = part;
-        job.view.partPct = 100;
-        this.onUpdate();
-      }
       if (r.ok) {
         const out = recorder.burnOutPath(part);
+        const latestInput=fileIdentity(mp4);
+        if(!sameContentIdentity(inputIdentity,latestInput)||currentTimeline()!==timeline){const e=Error('弹幕烧录期间原片或时间轴发生变化，已保留文件等待重新检查');e.code='LR_SOURCE_BUSY';throw e;}
+        if(commentProof&&fileIdentity(danmakuFile)!==commentProof.identity){
+          const before=fileIdentity(danmakuFile);let text=null;try{text=fs.readFileSync(danmakuFile,'utf8');}catch{}
+          if(!before||text===null||fileIdentity(danmakuFile)!==before||require('node:crypto').createHash('sha256').update(text).digest('hex')!==commentProof.hash){const e=Error('弹幕烧录期间弹幕数据发生变化，已保留文件等待重新处理');e.code='LR_SOURCE_BUSY';throw e;}
+          commentProof.identity=before;
+        }else if(!commentProof&&fs.existsSync(danmakuFile)){const e=Error('弹幕数据在处理期间出现，已保留文件等待重新处理');e.code='LR_SOURCE_BUSY';throw e;}
+        let verifiedOutput=fileIdentity(out);
+        if(!verifiedOutput||recorder._validatedFiles?.get(out)!==verifiedOutput){
+          const checked=await recorder.validateMedia(out);
+          if(!checked.ok){const e=Error('弹幕成品校验未完成，原片和成品均已保留: '+String(checked.stderr||''));if(checked.retryable)e.code='LR_SOURCE_BUSY';throw e;}
+          verifiedOutput=fileIdentity(out);
+        }
+        if(!verifiedOutput||fileIdentity(out)!==verifiedOutput){const e=Error('弹幕成品校验期间发生变化，原片和成品均已保留');e.code='LR_SOURCE_BUSY';throw e;}
+        if(fileIdentity(mp4)!==latestInput||currentTimeline()!==timeline||(commentProof?fileIdentity(danmakuFile)!==commentProof.identity:fs.existsSync(danmakuFile))){const e=Error('弹幕成品校验期间原片或弹幕发生变化，已保留文件等待重新处理');e.code='LR_SOURCE_BUSY';throw e;}
+        if(latestInput&&verifiedOutput&&recorder._validatedFiles?.get(out)===verifiedOutput&&commentProof&&fileIdentity(mp4)===latestInput&&fileIdentity(danmakuFile)===commentProof.identity){
+          recorder.burnProofs ||= {};recorder.burnProofs[part]={input:latestInput,output:verifiedOutput,comments:commentProof.hash,timeline};
+        }
+        delete recorder.burnDirtyParts[part];
+        if(recorder.checkpoint?.()===false){recorder.burnDirtyParts[part]=true;const e=Error('弹幕处理结果暂未保存，原片和成品均已保留');e.code='LR_SOURCE_BUSY';throw e;}
         log.info(`[post] 弹幕版 OK (${r.vcodec}) ${(fs.statSync(out).size / 1048576).toFixed(1)}MB ${path.basename(out)}`);
         this.history.push({ name: nickname, file: path.basename(out), vcodec: r.vcodec, at: Date.now() });
         burned++;
+        if(job.view){job.view.partsDone=part;job.view.partPct=100;this.onUpdate();}
         if (!settings.keepRaw) {
           try { fs.unlinkSync(mp4); } catch {}
         }
@@ -394,4 +475,4 @@ class PostProcessor {
   }
 }
 
-module.exports = { PostProcessor, genAss, PauseSignal };
+module.exports = { PostProcessor, genAss, createTimelineMapper, partitionComments, textWidth, PauseSignal };

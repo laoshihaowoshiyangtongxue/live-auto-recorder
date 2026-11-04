@@ -23,6 +23,12 @@ function mediaIdentity(file){
     return {content,full:content+':'+s.ctimeNs};
   }catch{return null;}
 }
+function deferValidation(result,context){
+  if(!result?.retryable)return;
+  const e=Error(context+'暂未完成，已保留原文件等待重新检查: '+String(result.stderr||'文件暂不可用').slice(0,120));
+  e.code='LR_SOURCE_BUSY';throw e;
+}
+function sameIdentityContent(saved,current){return !!(typeof saved==='string'&&current&&saved.split(':').slice(0,4).join(':')===current.content);}
 
 // 安全校验: 只接受 http(s) 直链, 拒绝以 '-' 开头(防 ffmpeg 参数注入)
 function assertSafeUrl(url) {
@@ -324,7 +330,7 @@ class Recorder {
   // 烧录弹幕字幕到指定分片
   // assRelName: 项目根下的字幕文件相对名(默认 dm.ass); 并发车道各自独立文件防互相覆盖
   // 硬编优先(NVENC p5), 失败逐级回退到 NVENC 默认、x264 软编
-  async burnPartDanmaku(part, assRelName) {
+  async burnPartDanmaku(part, assRelName, {noComments=false}={}) {
     this._userAbort = false; // 重置上一次暂停标记(恢复续烧用)
     const assRef = assRelName || 'dm.ass';
     const mp4 = this.mp4Path(part);
@@ -335,10 +341,20 @@ class Recorder {
     const sourceIdentity = mediaIdentity(mp4);
     if (!sourceIdentity) throw new Error('弹幕烧录原片缺失或无法确认身份: '+mp4);
     const sourceDuration = await this._probeDuration(mp4);
-    const sourceChanged = () => mediaIdentity(mp4)?.full !== sourceIdentity.full;
-    let assHash=null;
-    try{assHash=require('node:crypto').createHash('sha256').update(fs.readFileSync(path.resolve(assRef))).digest('hex');}catch{}
-    const matchesCheckpoint=()=>{const c=this.burnCheckpoint;return !!(assHash&&c&&c.version===1&&c.part===part&&c.source===sourceIdentity.full&&c.assHash===assHash&&c.pending===mediaIdentity(pending)?.full);};
+    if(!Number.isFinite(sourceDuration)||sourceDuration<=0){if(mediaIdentity(mp4)?.content!==sourceIdentity.content)throw Error('弹幕烧录原片已移动或改变，停止处理: '+mp4);const e=Error('原片时长暂时无法确认，保留文件等待重新检查');e.code='LR_SOURCE_BUSY';throw e;}
+    // Metadata such as security attributes may change while another program
+    // opens the file. Only file identity, size and modification time describe
+    // the source bytes; ctime alone must not interrupt an encode.
+    const sourceChanged = () => mediaIdentity(mp4)?.content !== sourceIdentity.content;
+    let assHash=null,assText=null;
+    try{assText=fs.readFileSync(path.resolve(assRef),'utf8');assHash=require('node:crypto').createHash('sha256').update(assText).digest('hex');}catch{}
+    // Never bypass an ASS file containing actual dialogue, even if a caller
+    // mistakenly marks this part as having no comments.
+    const canCopy=noComments===true&&assText!==null&&!/^\s*Dialogue\s*:/im.test(assText);
+    const matchesCheckpointBase=c=>!!(assHash&&c&&c.part===part&&((c.version===2&&c.source===sourceIdentity.content)||(c.version===1&&c.source===sourceIdentity.full))&&c.assHash===assHash);
+    const sameCheckpointFile=(c,current)=>!!(current&&typeof c.pending==='string'&&c.pending.split(':').slice(0,4).join(':')===current.content);
+    const matchesCheckpoint=()=>{const c=this.burnCheckpoint,current=mediaIdentity(pending);return !!(matchesCheckpointBase(c)&&current&&(c.pending===current.full||(c.version===2&&sameCheckpointFile(c,current))));};
+    const matchesPublishedCheckpoint=()=>{const c=this.burnCheckpoint;return !!(matchesCheckpointBase(c)&&!fs.existsSync(pending)&&sameCheckpointFile(c,mediaIdentity(out)));};
     const clearCheckpoint=()=>{this.burnCheckpoint=null;this.checkpoint();};
     const archivePending=()=>{
       if(!fs.existsSync(pending))return;
@@ -351,6 +367,7 @@ class Recorder {
     // 硬编 NVENC 高质量档
     let error = '';
     const codecs = [
+      ...(canCopy?[['copy']]:[]),
       ['h264_nvenc', '-preset', 'p5', '-rc', 'vbr', '-cq', '20', '-b:v', '0'],
       ['h264_nvenc'],
       ['libx264', '-preset', 'veryfast', '-crf', '20'],
@@ -362,6 +379,14 @@ class Recorder {
       try { fs.renameSync(pending, saved); } catch (e) { throw new Error('原片已移动或改变，已校验的弹幕临时文件保留在 '+pending+'；保存备用文件失败: '+e.message); }
       throw new Error('原片已移动或改变，已校验的弹幕临时文件保留在 '+saved);
     };
+    const postponeCheck=checked=>{
+      if(!checked.retryable)return;
+      // The encoder already finished. Keep its checkpoint and temporary file;
+      // retry a complete decode when the temporary interference has cleared.
+      preservePending=true;
+      const e=Error('弹幕版校验暂未完成，已保留烧录结果等待重新检查: '+String(checked.stderr||'文件暂不可用').slice(0,120));
+      e.code='LR_SOURCE_BUSY';throw e;
+    };
     try {
       // A successful encoder exit is a durable boundary. Recheck both input
       // identities and decode the pending output before publishing it.
@@ -370,40 +395,75 @@ class Recorder {
         preservePending=true;this.onStage?.('恢复弹幕版完整性检查');
         const checked=await this.validateMedia(pending);
         if(sourceChanged())preserveVerified();
+        postponeCheck(checked);
         const outputDuration=checked.ok?await this._probeDuration(pending):0;
         if(sourceChanged())preserveVerified();
+        if(checked.ok&&(sourceDuration<=0||outputDuration<=0))postponeCheck({retryable:true,stderr:'暂时无法读取完整录像时长'});
         if(checked.ok&&sourceDuration>0&&Math.abs(sourceDuration-outputDuration)<=1){
           this._publish(pending,out);preservePending=false;const codec=this.burnCheckpoint.codec;clearCheckpoint();
           log.info('[rec] 复用上次烧录完成的弹幕临时文件:',path.basename(out));return {ok:true,vcodec:codec,resumed:true};
         }
         archivePending();preservePending=false;clearCheckpoint();
+      } else if(matchesPublishedCheckpoint()){
+        // A crash can occur after the verified temporary file was renamed but
+        // before its journal was cleared. Its file identity ties the published
+        // output to that exact checkpoint; decode again before accepting it.
+        this.assertSpace(0,'恢复已发布弹幕检查');this.onStage?.('恢复弹幕版完整性检查');
+        const expected=mediaIdentity(out),checked=await this.validateMedia(out);
+        if(sourceChanged())throw Error('弹幕原片发生变化，已保留现有弹幕版');
+        postponeCheck(checked);
+        const outputDuration=checked.ok?await this._probeDuration(out):0;
+        if(sourceChanged())throw Error('弹幕原片发生变化，已保留现有弹幕版');
+        if(checked.ok&&(sourceDuration<=0||outputDuration<=0))postponeCheck({retryable:true,stderr:'暂时无法读取完整录像时长'});
+        if(checked.ok&&mediaIdentity(out)?.full!==expected?.full)postponeCheck({retryable:true,stderr:'检查期间弹幕成品属性发生变化'});
+        if(checked.ok&&sourceDuration>0&&Math.abs(sourceDuration-outputDuration)<=1){
+          const codec=this.burnCheckpoint.codec;clearCheckpoint();log.info('[rec] 恢复已发布的弹幕成品:',path.basename(out));return {ok:true,vcodec:codec,resumed:true};
+        }
+        clearCheckpoint();
       } else if(fs.existsSync(pending)) { archivePending();clearCheckpoint(); }
       else if(this.burnCheckpoint)clearCheckpoint();
-      this.assertSpace(Math.max(64*1024**2,this._sizeOf(mp4)*4),'弹幕烧录');
       for (const codec of codecs) {
         if (sourceChanged()) throw new Error('弹幕烧录原片已移动或改变，停止重试: '+mp4);
-        this.onStage?.('弹幕烧录');
-        const r = await this._runFfmpeg(['-y', '-i', mp4, '-vf', 'ass=' + assRef, '-c:v', ...codec,
-          '-fps_mode','passthrough','-enc_time_base:v','1:1000000',
-          '-c:a', 'copy', '-loglevel', 'error', pending], 86400000, false, sourceDuration);
+        const copying=codec[0]==='copy';
+        this.assertSpace(Math.max(64*1024**2,this._sizeOf(mp4)*(copying?1.2:4)),copying?'复制无弹幕录像':'弹幕烧录');
+        this.onStage?.(copying?'复制无弹幕录像':'弹幕烧录');
+        const args=copying
+          ? ['-y','-v','error','-i',mp4,'-map','0','-c','copy','-movflags','+faststart',pending]
+          : ['-y','-i',mp4,'-vf','ass='+assRef,'-c:v',...codec,'-fps_mode','passthrough','-enc_time_base:v','1:1000000','-c:a','copy','-loglevel','error',pending];
+        const r = await this._runFfmpeg(args,86400000,false,sourceDuration);
         error = r.stderr;
         if (this._userAbort) return { ok: false, stderr: '用户暂停', aborted: true };
         if(r.spaceError||/no space left|ENOSPC/i.test(error))throw new DiskSpaceError(error);
         if (sourceChanged() && (r.code !== 0 || hasMediaErrors(r.stderr) || this._sizeOf(pending) <= 1024)) throw new Error('弹幕烧录原片已移动或改变，停止重试: '+mp4);
-        if (r.code !== 0 || hasMediaErrors(r.stderr) || this._sizeOf(pending) <= 1024) continue;
+        if (r.code !== 0 || hasMediaErrors(r.stderr) || this._sizeOf(pending) <= 1024) {
+          if(copying)log.warn('[rec] 无弹幕录像直拷未完成，转为常规处理:',String(r.stderr||'输出不完整').slice(0,160));
+          continue;
+        }
         if(sourceChanged())throw new Error('弹幕烧录原片已移动或改变，停止处理: '+mp4);
+        if(copying){
+          // Packet content and presentation timing must both match before a
+          // stream-copy result can be used as the comment-free version.
+          const copied=mediaIdentity(pending);if(!copied){error='无弹幕录像无法确认文件身份';continue;}
+          this.onStage?.('核对无弹幕录像');
+          try{await require('./upload-split').compareTimelines(this,mp4,pending,{comparePackets:true,maxTimeDelta:0.001});}
+          catch(e){if(['LR_DISK_SPACE','LR_SOURCE_BUSY','LR_USER_PAUSED','LR_CANCELED','LR_EXIT_DEFERRED'].includes(e.code))throw e;error=e.message;log.warn('[rec] 无弹幕录像直拷核对未通过，转为常规处理:',e.message);continue;}
+          if(sourceChanged())throw new Error('弹幕烧录原片已移动或改变，停止处理: '+mp4);
+          if(mediaIdentity(pending)?.full!==copied.full){error='无弹幕录像核对期间发生变化';continue;}
+        }
         const pendingIdentity=mediaIdentity(pending);
         if(assHash&&pendingIdentity){
-          this.burnCheckpoint={version:1,part,source:sourceIdentity.full,pending:pendingIdentity.full,assHash,codec:codec[0]};
+          this.burnCheckpoint={version:2,part,source:sourceIdentity.content,pending:pendingIdentity.full,assHash,codec:codec[0]};
           preservePending=true;
           if(this.checkpoint()===false){const e=Error('弹幕烧录进度暂未保存，临时文件已保留');e.code='LR_SOURCE_BUSY';throw e;}
         }
         const checked = await this.validateMedia(pending);
+        if(sourceChanged())preserveVerified();
+        postponeCheck(checked);
         if (!checked.ok) { error = checked.stderr; preservePending=false;clearCheckpoint();continue; }
-        if (sourceChanged()) preserveVerified();
         const originalDuration=await this._probeDuration(mp4),outputDuration=await this._probeDuration(pending);
         if (sourceChanged()) preserveVerified();
-        if(originalDuration<=0||Math.abs(originalDuration-outputDuration)>1){error='弹幕版时长与原片不一致，源文件已保留';preservePending=false;clearCheckpoint();continue;}
+        if(originalDuration<=0||outputDuration<=0)postponeCheck({retryable:true,stderr:'暂时无法读取完整录像时长'});
+        if(Math.abs(originalDuration-outputDuration)>1){error='弹幕版时长与原片不一致，源文件已保留';preservePending=false;clearCheckpoint();continue;}
         this._publish(pending, out);preservePending=false;clearCheckpoint();
         return { ok: true, vcodec: codec[0] };
       }
@@ -420,24 +480,44 @@ class Recorder {
     return Math.max(120000, Math.ceil(bytes / 1073741824) * 120000);
   }
 
-  async validateMedia(file) {
+  async validateMedia(file, {allowDiscardTimestampRetry=false}={}) {
     const identity=mediaIdentity(file);this._validationInFlight ||= new Map();
-    const active=this._validationInFlight.get(file);if(identity&&active?.identity===identity.full)return active.promise;
-    const promise=this._validateMedia(file),entry={identity:identity?.full,promise};this._validationInFlight.set(file,entry);
-    try{return await promise;}finally{if(this._validationInFlight.get(file)===entry)this._validationInFlight.delete(file);}
+    const key=allowDiscardTimestampRetry?file+'\0split':file;
+    const active=this._validationInFlight.get(key);if(identity&&active?.identity===identity.full)return active.promise;
+    const promise=this._validateMedia(file,{allowDiscardTimestampRetry}),entry={identity:identity?.full,promise};this._validationInFlight.set(key,entry);
+    try{return await promise;}finally{if(this._validationInFlight.get(key)===entry)this._validationInFlight.delete(key);}
   }
-  async _validateMedia(file) {
+  async _validateMedia(file, {allowDiscardTimestampRetry=false}={}) {
     this.onStage?.('完整性检查');
     const before=mediaIdentity(file);
+    if(!before)return {ok:false,retryable:fs.existsSync(file),stderr:'录像暂时无法确认文件身份，原文件已保留'};
     this._validatedFiles ||= new Map();
     if(before&&this._validatedFiles.get(file)===before.full)return {ok:true,stderr:'',reused:true};
     const duration=await this._probeDuration(file);
-    const r = await this._runFfmpeg(['-v', 'error', '-err_detect', 'explode', '-i', file,
+    let r = await this._runFfmpeg(['-v', 'error', '-err_detect', 'explode', '-i', file,
       '-map', '0:v:0', '-map', '0:a?', '-fps_mode', 'passthrough', '-enc_time_base:v', '1:1000000', '-f', 'null', '-'], Math.max(this._processingTimeout([file]),Math.ceil(duration*1000)), false, duration);
+    // The null muxer can reject duplicate decoded-frame timestamps even when
+    // decoding succeeded. Retry the entire decode with synthetic timestamps
+    // for the discard-only video output; the source file is never modified.
+    const lines=String(r.stderr||'').split(/\r?\n/).filter(line=>line.trim());
+    let usedTimestampRetry=false;
+    if(allowDiscardTimestampRetry&&r.code===0&&lines.length&&lines.every(line=>/^\[null @ [^\]]+\] Application provided invalid, non monotonically increasing dts to muxer in stream 0: -?\d+ >= -?\d+\s*$/.test(line))){
+      usedTimestampRetry=true;
+      r=await this._runFfmpeg(['-v','error','-err_detect','explode','-i',file,
+        '-map','0:v:0','-map','0:a?','-vf','settb=1/1000000,setpts=N*1000','-fps_mode','passthrough','-enc_time_base:v','1:1000000','-f','null','-'],Math.max(this._processingTimeout([file]),Math.ceil(duration*1000)),false,duration);
+    }
     const result={ok:r.code===0&&!hasMediaErrors(r.stderr),stderr:r.stderr};
+    if(!result.ok&&(r.timedOut||/permission denied|resource temporarily unavailable|sharing violation|being used by another process|\b(?:EPERM|EACCES|EBUSY)\b/i.test(String(r.stderr))))result.retryable=true;
     const after=mediaIdentity(file);
-    if(result.ok&&before&&after?.full!==before.full)return {ok:false,stderr:'完整性检查期间文件发生变化，保留原文件等待重新检查'};
-    if(result.ok&&before&&after?.full===before.full){
+    if(before&&after?.full!==before.full){
+      if(result.ok&&allowDiscardTimestampRetry&&after?.content===before.content)result.metadataChanged=true;
+      else {
+        const fields=['设备','文件标识','大小','修改时间','元数据时间'];
+        const changed=after?fields.filter((_,i)=>before.full.split(':')[i]!==after.full.split(':')[i]).join('、'):'暂时无法访问';
+        return {ok:false,retryable:true,stderr:'完整性检查期间文件发生变化（'+changed+'），保留原文件等待重新检查'};
+      }
+    }
+    if(result.ok&&before&&after?.full===before.full&&!usedTimestampRetry){
       this._validatedFiles.set(file,after.full);
       if(this._validatedFiles.size>32)this._validatedFiles.delete(this._validatedFiles.keys().next().value);
     }
@@ -478,34 +558,75 @@ class Recorder {
   _commitMerge(plan){
     this.mergedDurations=plan.durations;this.mergedSegStarts=plan.starts;this.mergedReplayOffsets=plan.offsets;
     this.mergedFromParts=plan.originalParts;this.mergedInputs=plan.files.filter(f=>f!==plan.destination);this.mergeDestination=plan.destination;
-    for(const part of plan.emptyParts||[])for(const file of [this.flvPath(part),this.mp4Path(part)])if(file!==plan.destination&&fs.existsSync(file)&&this._sizeOf(file)===0)this.mergedInputs.push(file);
-    this.partStarts[1]=plan.starts[0];this.part=1;this.partStarts.length=2;this.emptyParts.clear();this.mergePlan=null;
+    this.mergedInputIdentities={};
+    if(Array.isArray(plan.sourceIdentities))for(let i=0;i<plan.files.length;i++)if(plan.files[i]!==plan.destination&&plan.sourceIdentities[i])this.mergedInputIdentities[plan.files[i]]=plan.sourceIdentities[i];
+    for(const part of plan.emptyParts||[])for(const file of [this.flvPath(part),this.mp4Path(part)])if(file!==plan.destination&&fs.existsSync(file)&&this._sizeOf(file)===0){this.mergedInputs.push(file);const identity=mediaIdentity(file);if(identity)this.mergedInputIdentities[file]=identity.content;}
+    this.partStarts[1]=plan.starts[0];this.part=1;this.partStarts.length=2;this.emptyParts.clear();this.mergePlan=null;this.mergeFallbackExtension=null;
     if(this.checkpoint()===false)return;
     this._cleanupMergedInputs();
   }
   _cleanupMergedInputs(){
     this.mergedInputs=(this.mergedInputs||[]).filter(file=>{
-      try{assertSafePath(file,this.base);if(!new RegExp('^_part\\d+\\.(flv|mp4)$').test(file.slice(this.base.length)))return true;fs.unlinkSync(file);return false;}
-      catch(e){if(e.code==='ENOENT')return false;log.warn('[rec] 合并源文件暂保留:',e.message);return true;}
+      try{
+        assertSafePath(file,this.base);if(!new RegExp('^_part\\d+\\.(flv|mp4)$').test(file.slice(this.base.length)))return true;
+        const current=mediaIdentity(file);if(!current&&!fs.existsSync(file)){delete this.mergedInputIdentities?.[file];return false;}
+        const expected=this.mergedInputIdentities?.[file];
+        if(!expected||current?.content!==expected){log.warn('[rec] 合并源分片身份不匹配，已保留:',path.basename(file));return true;}
+        fs.unlinkSync(file);delete this.mergedInputIdentities[file];return false;
+      }catch(e){if(e.code==='ENOENT'){delete this.mergedInputIdentities?.[file];return false;}log.warn('[rec] 合并源文件暂保留:',e.message);return true;}
     });this.checkpoint();
   }
   async recoverMergePlan(){
     const plan=this.mergePlan;
     if(!plan){
       if(this.mergedInputs?.length){
-        let verified=false;for(const file of [this.flvPath(1),this.mp4Path(1),this.burnOutPath(1)])if(fs.existsSync(file)&&(await this.validateMedia(file)).ok){verified=true;break;}
+        let verified=false;for(const file of [this.flvPath(1),this.mp4Path(1),this.burnOutPath(1)])if(fs.existsSync(file)){const checked=await this.validateMedia(file);deferValidation(checked,'合并成品校验');if(checked.ok){verified=true;break;}}
         if(!verified)throw new Error('合并产物无法验证，保留全部剩余源分片');
         this._cleanupMergedInputs();
       }return;
     }
-    if(![this.flvPath(1),this.mp4Path(1)].includes(plan.destination)||!Array.isArray(plan.files)||plan.files.some(f=>!f.startsWith(this.base)||!/^_part\d+\.(flv|mp4)$/.test(f.slice(this.base.length))))throw new Error('合并恢复记录无效，源文件已保留');
-    const matches=file=>{try{const s=fs.statSync(file);return s.ino===plan.identity.ino&&s.dev===plan.identity.dev&&s.size===plan.identity.size;}catch{return false;}};
+    if(![this.flvPath(1),this.mp4Path(1)].includes(plan.destination)||plan.output!==plan.destination+'.pending.'+path.extname(plan.destination).slice(1)||!Array.isArray(plan.files)||plan.files.some(f=>!f.startsWith(this.base)||!/^_part\d+\.(flv|mp4)$/.test(f.slice(this.base.length))))throw new Error('合并恢复记录无效，源文件已保留');
+    const matches=file=>{try{const s=fs.statSync(file);return s.ino===plan.identity.ino&&s.dev===plan.identity.dev&&s.size===plan.identity.size&&(!plan.identity.content||mediaIdentity(file)?.content===plan.identity.content);}catch{return false;}};
     const source=matches(plan.destination)?plan.destination:matches(plan.output)?plan.output:null;
     if(!source){
       if(!fs.existsSync(plan.destination)&&fs.existsSync(plan.destination+'.previous'))fs.renameSync(plan.destination+'.previous',plan.destination);
       this.mergePlan=null;this.checkpoint();return;
     }
-    const checked=await this.validateMedia(source);if(!checked.ok)throw new Error('中断合并产物验证失败，全部文件已保留');
+    if(Array.isArray(plan.sourceIdentities)){
+      if(plan.sourceIdentities.length!==plan.files.length)throw Error('合并源文件记录无效，全部文件已保留');
+      for(let i=0;i<plan.files.length;i++)if(!(source===plan.destination&&plan.files[i]===plan.destination)&&mediaIdentity(plan.files[i])?.content!==plan.sourceIdentities[i]){
+        if(source===plan.output){
+          const archive=source+'.interrupted-'+require('node:crypto').randomUUID();
+          try{fs.renameSync(source,archive);}catch(e){e.code='LR_SOURCE_BUSY';throw e;}
+          this.mergePlan=null;if(this.checkpoint()===false){const e=Error('合并恢复状态暂未保存，源文件和临时录像均已保留');e.code='LR_SOURCE_BUSY';throw e;}
+          log.warn('[rec] 合并源分片已变化，保留先前合并文件并重新检查');return;
+        }
+        const e=Error('合并源分片发生变化，全部文件已保留等待重新检查');e.code='LR_SOURCE_BUSY';throw e;
+      }
+    }
+    const checked=await this.validateMedia(source);deferValidation(checked,'中断合并产物校验');
+    if(!checked.ok){
+      if(!matches(source)||(Array.isArray(plan.sourceIdentities)&&plan.files.some((file,i)=>!(source===plan.destination&&file===plan.destination)&&mediaIdentity(file)?.content!==plan.sourceIdentities[i]))){
+        const e=Error('合并校验期间文件发生变化，全部文件已保留等待重新检查');e.code='LR_SOURCE_BUSY';throw e;
+      }
+      // A broken temporary FLV must not trap every retry on the same file.
+      // Switch to independently validating/remuxing the original segments,
+      // but only when the original source identities are fully recorded and
+      // still match. Preserve the failed output for diagnosis.
+      if(source===plan.output&&plan.destination===this.flvPath(1)&&Array.isArray(plan.sourceIdentities)&&plan.sourceIdentities.length===plan.files.length&&matches(source)&&plan.files.every((file,i)=>mediaIdentity(file)?.content===plan.sourceIdentities[i])){
+        this.mergeFallbackExtension='mp4';
+        if(this.checkpoint()===false){const e=Error('备用处理路径暂未保存，原分片和临时文件均已保留');e.code='LR_SOURCE_BUSY';throw e;}
+        const archive=source+'.invalid-'+require('node:crypto').randomUUID();
+        try{fs.renameSync(source,archive);}catch(e){e.code='LR_SOURCE_BUSY';throw e;}
+        this.mergePlan=null;
+        if(this.checkpoint()===false){const e=Error('恢复进度暂未保存，原分片和临时文件均已保留');e.code='LR_SOURCE_BUSY';throw e;}
+        const notice='合并临时文件未通过检查，已保留并改用原分片重新处理';
+        if(!this.notices.includes(notice))this.notices.push(notice);
+        log.warn('[rec]',notice,String(checked.stderr||'').slice(0,240));return;
+      }
+      throw new Error('中断合并产物验证失败，全部文件已保留: '+String(checked.stderr||'未知错误').slice(0,180));
+    }
+    if(!matches(source)||(this._validatedFiles?.has(source)&&this._validatedFiles.get(source)!==mediaIdentity(source)?.full)||(Array.isArray(plan.sourceIdentities)&&plan.files.some((file,i)=>!(source===plan.destination&&file===plan.destination)&&mediaIdentity(file)?.content!==plan.sourceIdentities[i]))){const e=Error('合并恢复校验期间文件发生变化，全部文件已保留');e.code='LR_SOURCE_BUSY';throw e;}
     if(source!==plan.destination){
       if(!fs.existsSync(plan.destination)&&fs.existsSync(plan.destination+'.previous'))fs.renameSync(plan.destination+'.previous',plan.destination);
       this._publish(source,plan.destination);
@@ -521,9 +642,11 @@ class Recorder {
     for(let part=1;part<=this.part;part++)for(const target of [this.mp4Path(part),this.burnOutPath(part)]){
       const backup=target+'.previous';if(!fs.existsSync(backup))continue;
       if(!fs.existsSync(target))fs.renameSync(backup,target);
-      else if((await this.validateMedia(target)).ok)archive(backup);
-      else if((await this.validateMedia(backup)).ok){archive(target);fs.renameSync(backup,target);}
-      else throw new Error('中断发布的两份文件均未通过验证，原文件已保留');
+      else{
+        const primary=await this.validateMedia(target);deferValidation(primary,'发布成品校验');
+        if(primary.ok)archive(backup);
+        else{const previous=await this.validateMedia(backup);deferValidation(previous,'发布备份校验');if(previous.ok){archive(target);fs.renameSync(backup,target);}else throw new Error('中断发布的两份文件均未通过验证，原文件已保留');}
+      }
       const notice='已恢复中断的文件发布，原有产物受到保护';if(!this.notices.includes(notice))this.notices.push(notice);this.checkpoint();
     }
   }
@@ -567,7 +690,9 @@ class Recorder {
     const listPath = this.base + '_concat.txt';
     const destination = extension === 'flv' ? this.flvPath(1) : this.mp4Path(1);
     const output = destination + '.pending.' + extension;
-    let scans;
+    const sourceIdentities=files.map(file=>mediaIdentity(file)?.content);
+    if(sourceIdentities.some(identity=>!identity)){const e=Error('合并源分片暂时无法确认身份');e.code='LR_SOURCE_BUSY';throw e;}
+    let scans,preserveOutput=false;
     try {
       scans = [];
       for (const file of files) scans.push(await this._scanVideo(file));
@@ -598,23 +723,40 @@ class Recorder {
       const r = await this._runFfmpeg(args, this._processingTimeout(files), false, durations.reduce((a,b)=>a+b,0));
       if(r.spaceError||/no space left|ENOSPC/i.test(r.stderr))throw new DiskSpaceError(r.stderr);
       if (r.code !== 0 || hasMediaErrors(r.stderr) || this._sizeOf(output) <= 1024) throw new Error('拼接输出异常: ' + r.stderr.slice(0, 180));
+      if(files.some((file,i)=>mediaIdentity(file)?.content!==sourceIdentities[i])){const e=Error('合并期间源分片发生变化，原文件已保留');e.code='LR_SOURCE_BUSY';throw e;}
+      let outputStat=fs.statSync(output),outputContent=mediaIdentity(output)?.content;
+      if(!outputContent){const e=Error('合并产物暂时无法确认身份，源分片已保留');e.code='LR_SOURCE_BUSY';throw e;}
+      const plan={files,output,destination,identity:{ino:outputStat.ino,dev:outputStat.dev,size:outputStat.size,content:outputContent},sourceIdentities,originalParts:this.part,emptyParts:[...this.emptyParts],durations,starts:indices.map(i=>this.partStarts[i]||this.startedAt),offsets:scans.map((_s,i)=>i>0&&cuts[i-1]!==null?scans[i-1].duration-durations[i-1]:0)};
+      this.mergePlan=plan;preserveOutput=true;
+      if(this.checkpoint()===false){const e=Error('合并进度暂未保存，原分片与合并文件已保留');e.code='LR_SOURCE_BUSY';throw e;}
       const validation = await this.validateMedia(output);
-      if (!validation.ok) throw new Error('拼接完整性检查失败: ' + validation.stderr.slice(0, 180));
-      const identity=fs.statSync(output);
-      const plan={files,output,destination,identity:{ino:identity.ino,dev:identity.dev,size:identity.size},originalParts:this.part,emptyParts:[...this.emptyParts],durations,starts:indices.map(i=>this.partStarts[i]||this.startedAt),offsets:scans.map((_s,i)=>i>0&&cuts[i-1]!==null?scans[i-1].duration-durations[i-1]:0)};
-      this.mergePlan=plan;if(this.checkpoint()===false)throw new Error('任务记录暂不可写，原分片保留');
+      deferValidation(validation,'合并录像校验');
+      if (!validation.ok) {
+        // Try repairing the temporary MP4, never the original segments. The
+        // repair checks complete decoding, packet equality and audio/video
+        // presentation timing before it can replace the temporary merge.
+        const fixed=extension==='mp4'&&await this._recoverTimestamps(output,output,validation.stderr);
+        if(!fixed){this.mergePlan=null;this.checkpoint();preserveOutput=false;throw new Error('拼接完整性检查失败: ' + validation.stderr.slice(0, 180));}
+        outputStat=fs.statSync(output);outputContent=mediaIdentity(output)?.content;if(!outputContent){const e=Error('修复后的合并产物暂时无法确认身份');e.code='LR_SOURCE_BUSY';throw e;}plan.identity={ino:outputStat.ino,dev:outputStat.dev,size:outputStat.size,content:outputContent};
+        if(this.checkpoint()===false){const e=Error('修复后的合并进度暂未保存，原分片与合并文件已保留');e.code='LR_SOURCE_BUSY';throw e;}
+        const notice='合并录像已无损修复时间戳并核对音视频数据包';if(!this.notices.includes(notice))this.notices.push(notice);
+      }
+      if(files.some((file,i)=>mediaIdentity(file)?.content!==sourceIdentities[i])){const e=Error('合并校验期间源分片发生变化，原文件已保留');e.code='LR_SOURCE_BUSY';throw e;}
+      if(mediaIdentity(output)?.content!==plan.identity.content||(this._validatedFiles?.has(output)&&this._validatedFiles.get(output)!==mediaIdentity(output)?.full)){const e=Error('合并产物校验期间发生变化，原文件已保留');e.code='LR_SOURCE_BUSY';throw e;}
       // Only commit timeline metadata after the replacement has actually succeeded.
       this._publish(output, destination);
       this._commitMerge(plan);
       log.info('[rec] 已验证并合并' + files.length + '个分片');
       return true;
     } catch (e) {
-      if(['LR_DISK_SPACE','LR_SOURCE_BUSY','LR_USER_PAUSED'].includes(e.code))throw e;
+      if(['EPERM','EACCES','EBUSY'].includes(e.code))e.code='LR_SOURCE_BUSY';
+      if(preserveOutput&&this.mergePlan&&!['LR_DISK_SPACE','LR_USER_PAUSED','LR_CANCELED','LR_EXIT_DEFERRED'].includes(e.code))e.code='LR_SOURCE_BUSY';
+      if(['LR_DISK_SPACE','LR_SOURCE_BUSY','LR_USER_PAUSED','LR_CANCELED','LR_EXIT_DEFERRED'].includes(e.code))throw e;
       log.warn('[rec] 合并未完成, 原分片全部保留:', e.message);
       return false;
     } finally {
       try { fs.unlinkSync(listPath); } catch {}
-      try { fs.unlinkSync(output); } catch {}
+      if(!preserveOutput)try { fs.unlinkSync(output); } catch {}
     }
   }
 
@@ -645,7 +787,14 @@ class Recorder {
     try{source=await this._scanVideo(flv);}catch(e){if(['LR_DISK_SPACE','LR_SOURCE_BUSY','LR_USER_PAUSED'].includes(e.code))throw e;return null;}
     const sourceFrames=source.packetCount??source.packets.length;
     if(sourceFrames<30)return null;
-    for(const codec of [['h264_nvenc','-preset','p5','-rc','vbr','-cq','20','-b:v','0'],['libx264','-preset','veryfast','-crf','20']]){
+    // Estimate the original total bitrate from the captured bytes and duration.
+    // ABR keeps a repair close to the source size instead of allowing CQ to
+    // grow without bound. A re-encode is still lossy and the FLV is retained.
+    const sourceBytes=this._sizeOf(flv),duration=source.duration;
+    if(!Number.isFinite(duration)||duration<=0||sourceBytes<=0)return null;
+    const target=Math.max(250000,Math.min(100000000,Math.round(sourceBytes*8/duration*1.05)));
+    const rate=['-b:v',String(target),'-maxrate',String(target*2),'-bufsize',String(target*4)];
+    for(const codec of [['h264_nvenc','-preset','p5','-rc','vbr',...rate],['libx264','-preset','veryfast',...rate]]){
       this.assertSpace(Math.max(64*1024**2,this._sizeOf(flv)*4),'恢复损坏画面');
       this.onStage?.('恢复损坏画面');
       const r=await this._runFfmpeg(['-y','-v','warning','-fflags','+discardcorrupt','-err_detect','ignore_err','-i',flv,
@@ -659,7 +808,7 @@ class Recorder {
       if(r.spaceError||/no space left|ENOSPC/i.test(r.stderr))throw new DiskSpaceError(r.stderr);
       if(r.code!==0||this._sizeOf(pending)<=1024)continue;
       // Source decoder warnings are expected; the rebuilt output must decode cleanly.
-      const checked=await this.validateMedia(pending);if(!checked.ok)continue;
+      const checked=await this.validateMedia(pending);deferValidation(checked,'修复录像校验');if(!checked.ok)continue;
       let output;try{output=await this._scanVideo(pending);}catch(e){if(['LR_DISK_SPACE','LR_SOURCE_BUSY','LR_USER_PAUSED'].includes(e.code))throw e;continue;}
       const outputFrames=output.packetCount??output.packets.length;
       const missing=Math.max(0,sourceFrames-outputFrames);
@@ -670,6 +819,35 @@ class Recorder {
     return null;
   }
 
+  async _recoverTimestamps(flv,pending,error){
+    // Only try a packet-copy repair for the null muxer's timestamp diagnostic.
+    // Decoder warnings or other errors must still take the existing repair path.
+    const lines=String(error||'').split(/\r?\n/).filter(line=>line.trim());
+    // FFmpeg stderr is tail-limited; its first retained line may be cut in
+    // the middle. Discard only a recognisable suffix of this exact diagnostic.
+    if(lines.length>1&&!lines[0].startsWith('[')&&/non monotonically increasing dts to muxer in stream [01]: -?\d+ >= -?\d+\s*$/.test(lines[0]))lines.shift();
+    if(!lines.length||!lines.every(line=>/^\[null @ [^\]]+\] Application provided invalid, non monotonically increasing dts to muxer in stream [01]: -?\d+ >= -?\d+\s*$/.test(line)))return null;
+    const before=mediaIdentity(flv);if(!before)return null;
+    const candidate=pending+'.timestamp.mp4';assertSafePath(candidate,this.base);
+    if(fs.existsSync(candidate))return null;
+    const bsf="setts=pts='PTS+max(0,PREV_OUTDTS+1-DTS)':dts='if(eq(N,0),DTS,max(DTS,PREV_OUTDTS+1))'";
+    try{
+      this.assertSpace(Math.ceil(this._sizeOf(flv)*1.1),'修复录像时间戳');this.onStage?.('无损修复时间戳');
+      const r=await this._runFfmpeg(['-y','-v','error','-i',flv,'-map','0:v:0','-map','0:a?','-c','copy','-bsf:v',bsf,'-bsf:a',bsf,'-movflags','+faststart',candidate],this._processingTimeout([flv]));
+      if(r.spaceError||/no space left|ENOSPC/i.test(r.stderr))throw new DiskSpaceError(r.stderr);
+      if(r.code!==0||hasMediaErrors(r.stderr)||this._sizeOf(candidate)<=1024)return null;
+      const checked=await this.validateMedia(candidate);deferValidation(checked,'时间戳修复校验');if(!checked.ok)return null;
+      const a=await this._probeDuration(flv),b=await this._probeDuration(candidate);
+      if(a<=0||b<=0||Math.abs(a-b)>1)return null;
+      const {compareTimelines}=require('./upload-split'),candidateBefore=mediaIdentity(candidate);
+      if(!candidateBefore)return null;
+      if(!await compareTimelines(this,flv,candidate,{comparePackets:true})||mediaIdentity(flv)?.full!==before.full||mediaIdentity(candidate)?.full!==candidateBefore.full)return null;
+      this._publish(candidate,pending);
+      return {kind:'timestamps'};
+    }catch(e){if(['LR_DISK_SPACE','LR_SOURCE_BUSY','LR_USER_PAUSED','LR_CANCELED','LR_EXIT_DEFERRED'].includes(e.code))throw e;return null;}
+    finally{try{fs.unlinkSync(candidate);}catch{}}
+  }
+
   async remuxAll(minSizeMB = 0) {
     if(this._openParts.size){const e=Error('录像文件仍在写入，关闭后自动处理');e.code='LR_SOURCE_BUSY';throw e;}
     const files = [];
@@ -677,7 +855,11 @@ class Recorder {
       const flv = this.flvPath(i), mp4 = this.mp4Path(i);
       if (!fs.existsSync(flv)) {
         if(fs.existsSync(mp4)){
-          const checked=await this.validateMedia(mp4);if(checked.ok)files.push(mp4);else this.issues.push(`分片${i}已有MP4损坏，需检查：${checked.stderr.slice(0,100)}`);
+          const saved=this.remuxCheckpoints?.[i];
+          if(saved&&!sameIdentityContent(saved.pending,mediaIdentity(mp4))){this.issues.push(`分片${i}原片缺失且现有MP4与转封装记录不符，已保留文件等待检查`);continue;}
+          const checked=await this.validateMedia(mp4);deferValidation(checked,'已有录像校验');
+          if(checked.ok){files.push(mp4);if(this.remuxCheckpoints?.[i]&&sameIdentityContent(this.remuxCheckpoints[i].pending,mediaIdentity(mp4))){delete this.remuxCheckpoints[i];this.checkpoint();}}
+          else this.issues.push(`分片${i}已有MP4损坏，需检查：${checked.stderr.slice(0,100)}`);
         }else if(!(this.emptyParts.has(i))&&!(this.settings?.keepRaw===false&&fs.existsSync(this.burnOutPath(i))))this.issues.push(`分片${i}文件缺失，不能确认整场完整`);
         continue;
       }
@@ -689,23 +871,53 @@ class Recorder {
       }
       const pending = mp4 + '.pending.mp4';
       assertSafePath(pending, this.base);
-      let recovered = null;
+      const original=mediaIdentity(flv);
+      if(!original){const e=Error('转封装原片暂时无法确认身份');e.code='LR_SOURCE_BUSY';throw e;}
+      const sourceChanged=()=>mediaIdentity(flv)?.content!==original.content;
+      this.remuxCheckpoints ||= {};
+      let saved=this.remuxCheckpoints[i],recovered=null,preservePending=false;
+      let resumePending=!!(saved?.version===1&&saved.source===original.content&&sameIdentityContent(saved.pending,mediaIdentity(pending)));
+      let resumePublished=!!(saved?.version===1&&saved.source===original.content&&!fs.existsSync(pending)&&sameIdentityContent(saved.pending,mediaIdentity(mp4)));
+      const saveCheckpoint=()=>{
+        const current=mediaIdentity(pending);if(!current)throw Error('转封装临时录像暂时无法确认身份');
+        saved={version:1,source:original.content,pending:current.full,recovered};this.remuxCheckpoints[i]=saved;preservePending=true;
+        if(this.checkpoint()===false){const e=Error('转封装进度暂未保存，原片和临时录像均已保留');e.code='LR_SOURCE_BUSY';throw e;}
+      };
       try {
-        this.assertSpace(Math.max(16*1024**2,this._sizeOf(flv)*1.1),'转封装');
-        this.onStage?.('转封装');
-        const r = await this._runFfmpeg(['-y', '-v', 'error', '-i', flv, '-c', 'copy', '-movflags', '+faststart', pending], this._processingTimeout([flv]));
-        if(r.spaceError||/no space left|ENOSPC/i.test(r.stderr))throw new DiskSpaceError(r.stderr);
-        if (r.code !== 0 || hasMediaErrors(r.stderr) || this._sizeOf(pending) <= 1024) {
-          recovered = await this._recoverTail(flv, pending);
-          if (!recovered) throw new Error('转封装异常: ' + r.stderr.slice(0, 180));
+        if(resumePending||resumePublished){
+          recovered=saved.recovered||null;preservePending=resumePending;this.onStage?.('恢复转封装检查');
+          log.info('[rec] 继续检查已转封装录像:',path.basename(resumePublished?mp4:pending));
+        }else{
+          if(fs.existsSync(pending)){
+            const archive=pending+'.interrupted-'+require('node:crypto').randomUUID()+'.mp4';
+            try{fs.renameSync(pending,archive);}catch(e){e.code='LR_SOURCE_BUSY';throw e;}
+            log.warn('[rec] 已保留未确认的转封装临时文件:',path.basename(archive));
+          }
+          if(saved){delete this.remuxCheckpoints[i];saved=null;if(this.checkpoint()===false){const e=Error('旧转封装状态暂未清理，原片已保留');e.code='LR_SOURCE_BUSY';throw e;}}
+          this.assertSpace(Math.max(16*1024**2,this._sizeOf(flv)*1.1),'转封装');
+          this.onStage?.('转封装');
+          const r = await this._runFfmpeg(['-y', '-v', 'error', '-i', flv, '-c', 'copy', '-movflags', '+faststart', pending], this._processingTimeout([flv]));
+          if(r.spaceError||/no space left|ENOSPC/i.test(r.stderr))throw new DiskSpaceError(r.stderr);
+          if (r.code !== 0 || hasMediaErrors(r.stderr) || this._sizeOf(pending) <= 1024) {
+            recovered = await this._recoverTail(flv, pending);
+            if (!recovered) throw new Error('转封装异常: ' + r.stderr.slice(0, 180));
+          }
+          if(sourceChanged()){preservePending=true;const e=Error('转封装期间原片发生变化，原片和临时录像均已保留');e.code='LR_SOURCE_BUSY';throw e;}
+          saveCheckpoint();
         }
-        const checked = await this.validateMedia(pending);
+        const checked = await this.validateMedia(resumePublished?mp4:pending);
+        deferValidation(checked,'转封装录像校验');
         if (!checked.ok) {
-          const decoded=await this._recoverDecoded(flv,pending,checked.stderr);
-          if(!decoded)throw new Error('完整性检查失败: '+checked.stderr.slice(0,180));
-          recovered=decoded;
+          const decoded=await this._recoverTimestamps(flv,pending,checked.stderr)||await this._recoverDecoded(flv,pending,checked.stderr);
+          if(!decoded){delete this.remuxCheckpoints[i];this.checkpoint();preservePending=false;throw new Error('完整性检查失败: '+checked.stderr.slice(0,180));}
+          recovered=decoded;resumePublished=false;saveCheckpoint();
         }
-        this._publish(pending, mp4);
+        const verifiedFile=resumePublished?mp4:pending,verifiedIdentity=mediaIdentity(verifiedFile);
+        if(!verifiedIdentity||(this._validatedFiles?.has(verifiedFile)&&this._validatedFiles.get(verifiedFile)!==verifiedIdentity.full)){const e=Error('转封装成品校验期间发生变化，原片和成品均已保留');e.code='LR_SOURCE_BUSY';throw e;}
+        if(sourceChanged()){const e=Error('转封装校验期间原片发生变化，原片和成品均已保留');e.code='LR_SOURCE_BUSY';throw e;}
+        if(!resumePublished)this._publish(pending, mp4);
+        preservePending=false;
+        if(sourceChanged()){const e=Error('转封装发布期间原片发生变化，原片和成品均已保留');e.code='LR_SOURCE_BUSY';throw e;}
         files.push(mp4);
         if (recovered) {
           let backup = flv;
@@ -715,22 +927,28 @@ class Recorder {
             if(fs.existsSync(backup)) throw new Error('备份目标已存在');
             fs.renameSync(flv,backup);
           } catch(e) {backup=flv;log.warn('[rec] 损坏原片仍保留在原位置:',e.message);}
-          const notice=recovered.kind==='decode'
+          const notice=recovered.kind==='timestamps'
+            ?`分片${i}已无损修复时间戳并核对音视频数据包，原始录像已备份`
+            :recovered.kind==='decode'
             ?`分片${i}已修复解码错误或异常时间戳并重新编码，画面包${recovered.outputFrames}/${recovered.sourceFrames}，损坏画面可能有容错痕迹，原始录像已备份`
             :`分片${i}已恢复：舍弃末尾不完整数据${recovered.droppedBytes}字节（视频包时间差${recovered.lostMs}毫秒），损坏原片已保留`;
-          this.notices.push(notice);log.warn('[rec]',notice,backup);
+          if(!this.notices.includes(notice))this.notices.push(notice);log.warn('[rec]',notice,backup);
         } else {
           try { fs.unlinkSync(flv); } catch (e) { log.warn('[rec] 已生成MP4, 原片仍保留:', e.message); }
         }
+        if(!fs.existsSync(flv))delete this.remuxCheckpoints[i];
+        if(this.checkpoint()===false){const e=Error('转封装状态暂未保存，已保留可恢复的录像');e.code='LR_SOURCE_BUSY';throw e;}
         log.info('[rec] 转封装及完整性检查通过: ' + path.basename(mp4));
       } catch (e) {
-        if(['LR_DISK_SPACE','LR_SOURCE_BUSY','LR_USER_PAUSED'].includes(e.code))throw e;
+        if(['EPERM','EACCES','EBUSY'].includes(e.code))e.code='LR_SOURCE_BUSY';
+        if(this.remuxCheckpoints?.[i]&&!['LR_DISK_SPACE','LR_USER_PAUSED','LR_CANCELED','LR_EXIT_DEFERRED'].includes(e.code))e.code='LR_SOURCE_BUSY';
+        if(['LR_DISK_SPACE','LR_SOURCE_BUSY','LR_USER_PAUSED','LR_CANCELED','LR_EXIT_DEFERRED'].includes(e.code))throw e;
         const issue = '分片' + i + '未完成, 源文件已保留: ' + e.message;
         this.issues.push(issue);
         log.error('[rec]', issue);
         files.push(flv);
       } finally {
-        try { fs.unlinkSync(pending); } catch {}
+        if(!preservePending)try { fs.unlinkSync(pending); } catch {}
       }
     }
     if(!files.length&&!this.issues.length)this.issues.push('本场没有有效录像文件，不能报告录制完成');

@@ -60,6 +60,14 @@ test('files with an active capture writer never enter remuxing',async()=>{
  await assert.rejects(rec.remuxAll(),e=>e.code==='LR_SOURCE_BUSY');assert.equal(ran,false);
   await assert.rejects(rec.mergeParts(),e=>e.code==='LR_SOURCE_BUSY');assert.equal(ran,false);
 });
+test('a saved FLV merge fallback goes directly to original-part remuxing',async()=>{
+ const fixture=recoveryFixture('merge-fallback-'),r=fixture.s.recovery,rec=new Recorder(path.join(fixture.directory,'fallback'));
+ rec.part=2;rec.partStarts=[0,Date.now(),Date.now()+1000];rec.settings={autoPartMerge:true};rec.mergeFallbackExtension='mp4';rec.assertSpace=()=>{};
+ for(const k of ['recoverPublications','recoverMergePlan','reconcileParts'])rec[k]=async()=>{};
+ let flvMerges=0,remuxes=0;rec.mergeParts=async()=>{flvMerges++;return false;};rec.remuxAll=async()=>{remuxes++;return [];};
+ r.store.set(rec,{status:'sealing',phase:'seal'});r.bind(rec);
+ try{await r.seal(rec,r.view(rec,r.store.get(rec.jobId)));assert.equal(flvMerges,0);assert.equal(remuxes,1);}finally{fixture.close();}
+});
 test('orphan cleanup stops only a recorded media child with matching owner and input',async()=>{
  const vm=require('node:vm'),module={exports:{}},file=path.resolve(__dirname,'../src/core/orphan-process.js');
  const base=path.join(root,'owner'),exe=path.join(root,'ffmpeg.exe'),killed=[];
@@ -85,7 +93,7 @@ test('a failed media spawn releases its budget and the next job proceeds',async(
 test('different jobs always have different subtitle paths even after another lane finishes',async()=>{
  const paths=[];const post=new PostProcessor(path.join(root,'dm.ass'),{});
  function job(id){const rec=new Recorder(path.join(root,id));rec.part=1;rec.partStarts=[0,0];rec.startedAt=0;fs.writeFileSync(rec.mp4Path(1),'fixture');const dm=rec.base+'.jsonl';fs.writeFileSync(dm,JSON.stringify({t:1000,text:id}));
-  rec._probeDuration=async()=>2;rec.burnPartDanmaku=async(part,ass)=>{paths.push(ass);fs.writeFileSync(rec.burnOutPath(1),'fixture');return {ok:true};};
+  rec._probeDuration=async()=>2;rec.validateMedia=async()=>({ok:true});rec.burnPartDanmaku=async(part,ass)=>{paths.push(ass);fs.writeFileSync(rec.burnOutPath(1),'fixture');return {ok:true};};
   return {id,recorder:rec,settings:{burnDanmaku:true,keepRaw:true},danmakuFile:dm,mergeComplete:true};}
  try{await post._process(job('first'));await post._process(job('second'));assert.equal(new Set(paths).size,2);}finally{post.close();}
 });

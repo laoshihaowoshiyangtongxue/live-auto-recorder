@@ -29,9 +29,10 @@ class MediaExecution {
     this.rec.onResourceReady?.();
     try{return await new Promise(resolve=>{
       let stderr='',stdout='',bytes=0,streamError=null,spaceError=null,stateError=null,settled=false;
-      const args=this.args,report=!this.capture&&!!this.rec.onProgress&&args.indexOf('-i')>=0&&args.indexOf('-i')<args.length-2;
+      const args=this.args,report=!!this.rec.onProgress&&args.indexOf('-i')>=0&&args.indexOf('-i')<args.length-2;
       this.progress=report?new ProcessingProgress(this.duration,value=>this.rec.onProgress?.(value)):null;
-      const child=spawn(this.executable,report?['-progress','pipe:1','-stats_period','0.5','-nostats',...args]:args,{windowsHide:true,stdio:['ignore',this.capture||report?'pipe':'ignore','pipe']});
+      const progressPipe=this.capture?'pipe:3':'pipe:1';
+      const child=spawn(this.executable,report?['-progress',progressPipe,'-stats_period','0.5','-nostats',...args]:args,{windowsHide:true,stdio:['ignore',this.capture||report?'pipe':'ignore','pipe',...(report&&this.capture?['pipe']:[])]});
       this.child=child;this.rec._activeProc=child;lowerPriority(child);
       this.rec.processingProcessId=child.pid;
       const finish=(code,signal)=>{if(settled)return;settled=true;this.done=true;this.freezeClock();clearInterval(diskTimer);this.lease?.release();this.lease=null;
@@ -43,7 +44,7 @@ class MediaExecution {
       const writes=typeof output==='string'&&require('node:path').isAbsolute(output)&&output.startsWith(this.rec.base)&&output!==input;
       const diskTimer=writes?setInterval(()=>{try{this.rec.assertSpace(0,'正在处理');}catch(e){spaceError=e;this.abort();}},1000):null;
       child.stderr.on('data',chunk=>stderr=(stderr+chunk.toString()).slice(-131072));
-      if(report)child.stdout.on('data',chunk=>this.progress.write(chunk));
+      if(report)(this.capture?child.stdio[3]:child.stdout).on('data',chunk=>this.progress.write(chunk));
       if(this.capture)child.stdout.on('data',chunk=>{if(streamError)return;try{
         if(typeof this.capture==='function')this.capture(chunk);
         else{bytes+=chunk.length;if(bytes>64*1024*1024)throw Error('媒体检测输出超过缓冲上限');stdout+=chunk.toString();}

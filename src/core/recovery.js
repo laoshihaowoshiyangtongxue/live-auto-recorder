@@ -8,7 +8,9 @@ const {writeJson}=require('../util/atomic-json');
 const log=require('../util/log');
 const {quietHours}=require('./quiet-hours');
 const {makePlan,applyPlan,makeArchivePlan,applyArchivePlan,videoFiles,isFinalVideoName,dateMigration}=require('./video-names');
+const {splitNamePlan,readRequestState,saveRequests}=require('./split-name-migration');
 const {MediaPool}=require('./media-pool');
+const {protectPart,restoreParts,cleanupParts}=require('./capture-protection');
 
 class RecoveryController{
   constructor(scheduler,file){
@@ -173,7 +175,7 @@ class RecoveryController{
     rec.availableBytes=()=>this.s.freeBytes(path.dirname(rec.base));
     rec.mediaPool=this.mediaPool;
     rec.processingOrder=()=>this.orderOf(rec.jobId);
-    rec.onPartClosed=part=>{this.store.set(rec,{lastClosedPart:part.part});};
+    rec.onPartClosed=part=>{try{protectPart(rec,part.part);}catch(e){log.warn('[jobs] 已关闭原片暂无法创建保护链接:',e.message);}this.store.set(rec,{lastClosedPart:part.part});};
     rec.onCheckpoint=()=>{this.store.set(rec);return !this.store.error;};
     if(task)this.contexts.set(rec.jobId,task);
     return rec;
@@ -236,10 +238,10 @@ class RecoveryController{
       if(rec._shutdownPaused){const e=Error('暂停任务留待下次启动');e.code='LR_USER_PAUSED';throw e;}
       rec.assertSpace(0,'恢复录像');
       if(!this.store.persist()){const e=new Error('任务记录暂不可写，保留源文件等待恢复');e.code='LR_SOURCE_BUSY';throw e;}
-      await rec.recoverPublications();checkCanceled();await rec.recoverMergePlan();checkCanceled();
+      await rec.recoverPublications();checkCanceled();await rec.recoverMergePlan();checkCanceled();restoreParts(rec);
       await rec.reconcileParts();checkCanceled();
       rec.issues=[];
-      if(rec.settings?.autoPartMerge)await rec.mergeParts();checkCanceled();
+      if(rec.settings?.autoPartMerge&&rec.mergeFallbackExtension!=='mp4')await rec.mergeParts();checkCanceled();
       if(this.store.error){const e=new Error('任务记录暂不可写，保留源文件等待恢复');e.code='LR_SOURCE_BUSY';throw e;}
       const files=await rec.remuxAll(rec.settings?.minSizeMB||0);checkCanceled();
       // Failed reconnects may contribute confirmed empty parts, so the number
@@ -288,6 +290,7 @@ class RecoveryController{
     }
     const state=this.store.set(rec,{status,phase:'publish',error:'',nextAttemptAt:0,attempts:0,waitReason:'',namingVersion:2});
     if(this.store.error)throw Error('录像已命名，完成状态暂未保存，下次继续恢复');
+    try{cleanupParts(rec);this.store.set(rec);}catch(e){log.warn('[jobs] 已发布录像的保护链接暂未清理:',e.message);}
     this.updateHistory(rec,state,status);this.taskError(rec,'');
     const view=this.s.post.items.find(v=>v.id===rec.jobId);if(view)this.s.post.finish(view,status,(rec.notices||[]).join('; '));
     if(shouldNotify)this.s.onEvent&&this.s.onEvent('record-done',{rid:state.rid,nickname:state.nickname,secs:state.secs||0,files:this.s.history.find(h=>h.jobId===state.id)?.files||[],warnings:[],notices:rec.notices||[],jobId:state.id});
@@ -302,6 +305,36 @@ class RecoveryController{
       const publicationPlan=job.publicationPlan.map(entry=>({...entry,destination:plan.find(p=>p.source===entry.destination)?.destination||entry.destination}));
       job=this.store.set(rec,{publicationPlan,namingMigrationPlan:null,namingVersion:2});this.updateHistory(rec,job,job.status,job.error||'');
     }else this.store.set(rec,{namingVersion:2});
+  }
+  migrateSplitNames(job){
+    const rec=this.bind(restoreRecorder(job,Recorder)),plan=splitNamePlan(rec,job);
+    if(!plan.length)return;
+    this.store.set(rec,{splitNamingMigrationPlan:plan});if(this.store.error)throw Error('分段改名计划暂未保存，原文件保留');
+    applyPlan(rec,plan,{renameFinal:true});
+    const publicationPlan=job.publicationPlan.map(entry=>({...entry,destination:plan.find(item=>item.source===entry.destination)?.destination||entry.destination}));
+    const state=this.store.set(rec,{publicationPlan,splitNamingMigrationPlan:null});
+    if(this.store.error)throw Error('分段改名结果暂未保存，将继续恢复');
+    this.updateHistory(rec,state,state.status,state.error||'');
+  }
+  processPendingSplitNames(){
+    this.lastSplitNameAttempt=Date.now();let request;
+    try{request=readRequestState(this.store.file);}catch(error){log.error('[names] 分段改名请求暂不可读:',error.message);return;}
+    const pending=new Set(request.jobs);
+    if(request.since!==null){
+      for(const job of this.store.jobs.values()){
+        const started=Number(job.recorder?.startedAt);
+        if(job.status!=='canceled'&&Number.isFinite(started)&&started>=request.since&&job.publicationPlan?.some(entry=>entry.splitTotal>1&&typeof entry.destination==='string'&&/_上传分段\d+(?:_\d+)?_(?:纯享版|弹幕版)\.mp4$/.test(entry.destination)))pending.add(job.id);
+      }
+      try{saveRequests(this.store.file,[...pending]);}catch(error){log.warn('[names] 分段改名范围暂未保存:',error.message);return;}
+    }
+    for(const job of this.store.jobs.values()){
+      if(!pending.has(job.id)&&!job.splitNamingMigrationPlan?.length)continue;
+      if(!DONE.has(job.status)||job.status==='canceled')continue;
+      try{
+        this.migrateSplitNames(job);
+        if(pending.delete(job.id))saveRequests(this.store.file,[...pending]);
+      }catch(error){log.warn('[names] 分段改名暂未完成，文件已保留:',error.message);}
+    }
   }
   async retry(id,manual=false){
     if(this.closing)return {ok:false,error:'程序正在退出，任务已保留待下次恢复'};
@@ -363,6 +396,7 @@ class RecoveryController{
   async start({background=false}={}){
     const initial=[];
     try{await this.scan();}catch(e){log.warn('[jobs] 恢复扫描暂未完成:',e.message);}
+    this.processPendingSplitNames();
     for(const job of [...this.store.jobs.values()].sort((a,b)=>this.orderOf(a.id)-this.orderOf(b.id))){
       if(this.closing)break;
       if(job.status==='canceled')continue;
@@ -401,6 +435,7 @@ class RecoveryController{
   async tick(){
     if(this.closing||this.ticking)return;this.ticking=true;
     try{
+      if(Date.now()-(this.lastSplitNameAttempt||0)>=60000)this.processPendingSplitNames();
       if(this.store.error)this.store.persist();
       for(const job of [...this.store.jobs.values()].sort((a,b)=>this.orderOf(a.id)-this.orderOf(b.id))){
         if(this.closing)break;

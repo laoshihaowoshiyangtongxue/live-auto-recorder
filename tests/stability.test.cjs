@@ -37,7 +37,8 @@ test('completed files are named and indexed before their final completion event'
  const events=[];s.onEvent=(type,data)=>{if(type==='record-done')events.push(data);};
  await s._stopJob(task,'下播');await drain(s.post);
  const saved=s.recovery.store.get(rec.jobId);assert.equal(saved.status,'done');assert.equal(saved.publicationPlan.length,2);
- assert.ok(s.history[0].files.every(f=>/2026-10-26_主播_10-00-00_主题_含_非法字符_(纯享版|弹幕版)\.mp4$/.test(f)));
+ const archiveDate=require('../src/core/video-names').stamp(rec,saved).date;
+ assert.ok(s.history[0].files.every(f=>path.basename(f)===`${archiveDate}_主播_10-00-00_主题_含_非法字符_纯享版.mp4`||path.basename(f)===`${archiveDate}_主播_10-00-00_主题_含_非法字符_弹幕版.mp4`));
  assert.ok(s.history[0].files.every(f=>fs.existsSync(path.join(s.outDir,f))));assert.deepEqual(events[0].files,s.history[0].files);
 });
 test('a crash during final naming resumes publication without rerunning FFmpeg',async()=>{
@@ -110,6 +111,31 @@ test('failed subtitle job persists its error and can retry to completion without
  assert.equal(events.some(e=>e.type==='record-done'),false);assert.ok(events.some(e=>e.type==='record-error'));assert.equal(s.history[0].status,'failed');assert.match(s.history[0].error,/temporary encoder/);assert.match(task.lastError,/temporary encoder/);
  const persisted=new JobStore(s.recovery.store.file).get(rec.jobId);assert.equal(persisted.status,'failed');assert.ok(persisted.nextAttemptAt>Date.now());
  await s.recovery.retry(rec.jobId,true);await drain(s.post);assert.equal(s.recovery.store.get(rec.jobId).status,'done');assert.equal(s.history[0].status,'done');assert.equal(s.history[0].files.length,2);assert.equal(s.history[0].error,'');assert.ok(events.some(e=>e.type==='record-done'));
+});
+test('temporary burn validation failure waits automatically and resumes without a second encode',async()=>{
+ const {s,task,rec}=await job('post-validation-wait');const validate=rec.validateMedia.bind(rec);let injected=false;
+ rec.validateMedia=async(file,...args)=>{if(file.includes('_弹幕版.mp4.pending.mp4')&&!injected){injected=true;return {ok:false,retryable:true,stderr:'模拟文件暂被占用'};}return validate(file,...args);};
+ await s._stopJob(task,'下播');await drain(s.post);
+ const waiting=s.recovery.store.get(rec.jobId);assert.equal(waiting.status,'waiting');assert.equal(waiting.attempts,0);assert.ok(waiting.nextAttemptAt>Date.now());assert.ok(waiting.recorder.burnCheckpoint);assert.equal(waiting.recorder.burnDirtyParts[1],true);
+ const run=Recorder.prototype._runFfmpeg;let encodes=0;Recorder.prototype._runFfmpeg=function(args,...rest){if(args.includes('-vf')&&!args.includes('null'))encodes++;return run.call(this,args,...rest);};
+ try{await s.recovery.retry(rec.jobId,true);await drain(s.post);}finally{Recorder.prototype._runFfmpeg=run;}
+ assert.equal(s.recovery.store.get(rec.jobId).status,'done');assert.equal(encodes,0);assertFinalVideos(s,rec);
+});
+test('a temporarily blocked remux check resumes the recorded checkpoint through the scheduler',async()=>{
+ const {s,task,rec}=await job('remux-validation-wait'),pending=rec.mp4Path(1)+'.pending.mp4',validate=rec.validateMedia.bind(rec);let injected=false;
+ rec.validateMedia=async(file,...args)=>{if(file===pending&&!injected){injected=true;return {ok:false,retryable:true,stderr:'模拟文件暂被占用'};}return validate(file,...args);};
+ await s._stopJob(task,'下播');const waiting=s.recovery.store.get(rec.jobId);assert.equal(waiting.status,'waiting');assert.ok(waiting.recorder.remuxCheckpoints[1]);assert.ok(fs.existsSync(pending));
+ const run=Recorder.prototype._runFfmpeg;let copies=0;Recorder.prototype._runFfmpeg=function(args,...rest){if(args.at(-1)===pending&&args.includes('copy'))copies++;return run.call(this,args,...rest);};
+ try{await s.recovery.retry(rec.jobId,true);await drain(s.post);}finally{Recorder.prototype._runFfmpeg=run;}
+ assert.equal(s.recovery.store.get(rec.jobId).status,'done');assert.equal(copies,0);assertFinalVideos(s,rec);
+});
+test('a temporarily blocked merge check resumes the saved merge through the scheduler',async()=>{
+ const {s,task,rec}=await job('merge-validation-wait',2),pending=rec.flvPath(1)+'.pending.flv',validate=rec.validateMedia.bind(rec);fs.copyFileSync(await fixture(),rec.flvPath(1));let injected=false;
+ rec.validateMedia=async(file,...args)=>{if(file===pending&&!injected){injected=true;return {ok:false,retryable:true,stderr:'模拟文件暂被占用'};}return validate(file,...args);};
+ await s._stopJob(task,'下播');const waiting=s.recovery.store.get(rec.jobId);assert.equal(waiting.status,'waiting');assert.ok(waiting.recorder.mergePlan);assert.ok(fs.existsSync(pending));
+ const run=Recorder.prototype._runFfmpeg;let merges=0;Recorder.prototype._runFfmpeg=function(args,...rest){if(args.includes('concat'))merges++;return run.call(this,args,...rest);};
+ try{await s.recovery.retry(rec.jobId,true);await drain(s.post);}finally{Recorder.prototype._runFfmpeg=run;}
+ assert.equal(s.recovery.store.get(rec.jobId).status,'done');assert.equal(merges,0);assertFinalVideos(s,rec);
 });
 test('zero disk space defers work durably and resumes after space returns',async()=>{
  const {s,task,rec}=await job('disk-wait');s.freeBytes=()=>0;let writes=0;const native=rec._runFfmpeg.bind(rec);rec._runFfmpeg=(...args)=>{writes++;return native(...args);};
@@ -196,7 +222,7 @@ test('an interrupted file publication restores its previous verified product',as
 });
 test('committed merge is recovered by file identity without appending its original parts twice',async()=>{
  const {s,rec}=await job('merge-journal',2);await command(['-y','-v','error','-ss','0','-i',await fixture(),'-t','4','-c','copy',rec.flvPath(1)]);await command(['-y','-v','error','-ss','4','-i',await fixture(),'-t','4','-c','copy',rec.flvPath(2)]);
- let plan;const publish=rec._publish.bind(rec);rec._publish=(pending,destination)=>{plan=structuredClone(rec.mergePlan);publish(pending,destination);};assert.equal(await rec.mergeParts(),true);assert.ok(plan);
- // Recreate the exact journal state of a crash after publish and before the commit checkpoint.
- const restored=new Recorder(rec.base);restored.part=2;restored.partStarts=[0,...plan.starts];restored.mergePlan=plan;fs.copyFileSync(await fixture(),restored.flvPath(2));await restored.recoverMergePlan();assert.equal(restored.part,1);assert.equal(restored.mergePlan,null);assert.equal(fs.existsSync(restored.flvPath(2)),false);assert.ok((await restored._probeDuration(restored.flvPath(1)))<9);
+ let plan;const publish=rec._publish.bind(rec);rec._publish=(pending,destination)=>{plan=structuredClone(rec.mergePlan);publish(pending,destination);throw Error('模拟发布后中断');};await assert.rejects(rec.mergeParts(),e=>e.code==='LR_SOURCE_BUSY');assert.ok(plan);assert.ok(fs.existsSync(rec.flvPath(2)));
+ // Stop at the real crash boundary so the original second file keeps its identity.
+ const restored=new Recorder(rec.base);restored.part=2;restored.partStarts=[0,...plan.starts];restored.mergePlan=plan;await restored.recoverMergePlan();assert.equal(restored.part,1);assert.equal(restored.mergePlan,null);assert.equal(fs.existsSync(restored.flvPath(2)),false);assert.ok((await restored._probeDuration(restored.flvPath(1)))<9);
 });

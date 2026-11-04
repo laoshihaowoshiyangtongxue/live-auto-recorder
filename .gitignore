@@ -26,3 +26,7 @@ recording-jobs.json.*
 # 本地自动化结果
 tests/electron/*-results.json
 tests/electron/*-error.txt
+
+录像整理备份/
+m0/dumps/
+m0/ttwid.txt

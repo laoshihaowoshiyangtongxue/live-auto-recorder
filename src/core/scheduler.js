@@ -12,9 +12,12 @@ const { DanmakuCapture } = require('./danmaku');
 const { PostProcessor } = require('./postprocess');
 const { pickFlv } = require('./adapter/douyin');
 const {roomDirectory,recordingDirs,locateHistoryFile}=require('./recording-paths');
+const {isFinalVideoName}=require('./video-names');
+const {DONE}=require('./job-store');
 const {writeJson}=require('../util/atomic-json');
 const {RecoveryController}=require('./recovery');
 const {NetworkBackoff}=require('./network-backoff');
+const {backupComments}=require('./capture-protection');
 
 // 分段参数解析(对齐 biliLive-tools): "90"=90分钟, "500MB"=按500MB大小分段, "0"=不分段
 function parseSegment(v) {
@@ -26,6 +29,16 @@ function parseSegment(v) {
   if (!m[2]) return { minSec: Math.min(n, 7 * 24 * 60) * 60, sizeMB: 0 };
   const mult = { B: 1 / 1048576, KB: 1 / 1024, MB: 1, GB: 1024 }[m[2].toUpperCase()];
   return { minSec: 0, sizeMB: Math.max(1, n * mult) };
+}
+
+function nextPollDelay({baseMs,elapsedMs,wobble,failures,confirmOffline}){
+  const interval=Math.round(baseMs*(0.8+wobble/100));
+  const backoff=Math.min((failures||0)*2000,300000);
+  // Measure the normal interval from the start of the previous poll, so time
+  // spent in the shared gate and network request is not waited a second time.
+  const normal=Math.max(250,interval-Math.max(0,elapsedMs));
+  // A second independent offline response must be at least one second later.
+  return (confirmOffline&&!failures?1000:normal)+backoff;
 }
 
 class Scheduler {
@@ -90,11 +103,16 @@ class Scheduler {
     if(this.recovery)protectedBases.push(...this.recovery.bases());
     if(this.post.current?.recorder?.base)protectedBases.push(this.post.current.recorder.base);
     for(const job of this.post.queue||[])if(job.recorder?.base)protectedBases.push(job.recorder.base);
+    const protectedFiles=new Set();
+    for(const job of this.recovery?.store?.jobs?.values()||[])if(!DONE.has(job.status))for(const entry of job.publicationPlan||[]){if(entry.source)protectedFiles.add(path.resolve(entry.source));if(entry.destination)protectedFiles.add(path.resolve(entry.destination));}
     try {
-      for (const dir of recordingDirs(this.outDir)) for (const f of fs.readdirSync(dir)) {
+      const rooms=recordingDirs(this.outDir),dirs=rooms.map(dir=>({dir,dated:false}));
+      for(const room of rooms.slice(1))for(const entry of fs.readdirSync(room,{withFileTypes:true}))if(entry.isDirectory()&&!entry.isSymbolicLink()&&/^\d{4}-\d{2}-\d{2}(?:凌晨)?$/.test(entry.name))dirs.push({dir:path.join(room,entry.name),dated:true});
+      for (const {dir,dated} of dirs) for (const f of fs.readdirSync(dir)) {
         if (!/\.mp4$|\.jsonl$/.test(f)) continue;
+        if(dated&&!isFinalVideoName(f))continue;
         const p = path.join(dir, f);
-        if(protectedBases.some(base=>p.startsWith(base)))continue;
+        if(protectedBases.some(base=>p.startsWith(base))||protectedFiles.has(path.resolve(p)))continue;
         try {
           const st = fs.lstatSync(p);
           if (st.isFile() && !st.isSymbolicLink() && !f.includes('.pending.') && st.mtimeMs < cutoff) { fs.unlinkSync(p); removed += 1; }
@@ -155,7 +173,7 @@ class Scheduler {
   }
 
   // 录像输出目录解析: 绝对路径直接用, 相对路径锚定应用根
-  // 绝对路径直接使用，相对路径以应用根目录为基准。
+  // (此前无条件 join(ROOT, dir), F:\recordings 会拼成 E:\应用目录\F:\recordings)
   _resolveOutDir(dir) {
     const d = String(dir || 'recordings');
     return path.isAbsolute(d) ? d : path.join(ROOT, d);
@@ -176,6 +194,7 @@ class Scheduler {
         .map(({ rid, secUid }) => (rid ? rid : 'sec:' + secUid)),
     );
     // 统一建任务: rid 任务键=rid; 主页监控任务键='sec:'+secUid
+    let newlyAdded=0;
     for (const w of this.cfg.watchlist) {
       const rid = String(w.rid || '');
       const secUid = String(w.secUid || '');
@@ -198,7 +217,7 @@ class Scheduler {
       const item = { rid, secUid, companyId: w.companyId || '', name: w.name || '', nickname: w.nickname || '', titleFilter: String(w.titleFilter || ''), hours: String(w.hours || ''), maxSec: +w.maxSec || 0 };
       const task = { rid, secUid, key, item, monitorPaused:!!w.monitorPaused, monitorVersion:0, state: 'idle', offCount: 0, paused: false, rec: null, dm: null, lastInfo: null, lastPollAt: 0, pollFails: 0, firstLiveAt: 0, stop: false };
       this.tasks.set(key, task);
-      const delay = this.tasks.size * 400; // 错峰
+      const delay = newlyAdded++ * 400; // 保持批量错峰，仅移除已有任务造成的额外等待
       this.timers.set(key, setTimeout(() => this._loop(task), delay));
       log.info(`[sched] 开始监控 ${key} (${item.name || '未命名'}${rid ? '' : ' 主页模式'})`);
     }
@@ -218,6 +237,7 @@ class Scheduler {
   // 循环调度: 间隔 = 基准抖动 + 失败退避(失败越多等越久, 最长5分钟), 防雪上加霜
   _loop(task) {
     if (task.stop || this.stopped) return;
+    const pollStartedAt=Date.now();
     this._poll(task)
       .catch((e) => this._pollError(task, e))
       .finally(() => {
@@ -226,8 +246,9 @@ class Scheduler {
         if (this.tasks.get(task.key) !== task) return;
         const base = (this.cfg.settings.pollIntervalSec || 3) * 1000;
         const wobble = ((Date.now() >> 7) + task.rid.length) % 41; // 0..40 稳定变化
-        const backoff = Math.min((task.pollFails || 0) * 2000, 300000);
-        const t = setTimeout(() => this._loop(task), Math.round(base * (0.8 + wobble / 100)) + backoff);
+        const confirmation=task.state==='recording'&&!task.paused&&task.offCount===1;
+        const delay=nextPollDelay({baseMs:base,elapsedMs:Date.now()-pollStartedAt,wobble,failures:task.pollFails,confirmOffline:confirmation});
+        const t = setTimeout(() => this._loop(task), delay);
         t.unref();
         this.timers.set(task.key, t);
       });
@@ -270,6 +291,8 @@ class Scheduler {
   _pollError(task, e) {
     if(task.monitorPaused||task.stop||this.stopped)return;
     this.networkBackoff?.failure(e);
+    // A failed request cannot confirm an earlier offline response.
+    task.offCount=0;
     task.pollFails += 1;
     log.warn(`[poll] ${task.rid || task.key} 第${task.pollFails}次失败: ${e.message}`);
     if (task.state === 'recording' && !task.paused && task.pollFails >= 3 &&
@@ -408,8 +431,7 @@ class Scheduler {
           return;
         }
         task.firstLiveAt = Date.now();
-        const latency = task.firstLiveAt - (task.lastPollAt || task.firstLiveAt);
-        log.info(`${tag} >>> 开播! 《${info.title}》 开始录制 (检测延迟≈${Math.max(0, latency)}ms+轮询间隔)`);
+        log.info(`${tag} >>> 检测到开播! 《${info.title}》 开始录制`);
         await this._startJob(task, info);
       }
     } else if (task.state === 'recording') {
@@ -588,6 +610,7 @@ class Scheduler {
     try {
       try { await rec.stop(); } catch (e) { log.error('[rec] stop异常', e.message); }
       try { await task.dm.stop(); } catch (e) { log.error('[dm] stop异常', e.message); }
+      try{await backupComments(task.basePath);}catch(e){log.warn('[dm] 弹幕备份暂未完成，原文件保留:',e.message);}
       if(this.recovery){const result=await this.recovery.processStopped(task,rec,view);enqueued=!!result.enqueued;return result;}
       // 相邻分片自动合并(对齐 biliLive-tools autoPartMerge): 断流重连的分片无缝并回一个文件
       if (settings.autoPartMerge) {
@@ -777,4 +800,4 @@ class Scheduler {
   }
 }
 
-module.exports = { Scheduler, parseSegment };
+module.exports = { Scheduler, parseSegment, nextPollDelay };

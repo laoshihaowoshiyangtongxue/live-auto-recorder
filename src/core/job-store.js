@@ -6,7 +6,7 @@ const log=require('../util/log');
 const DONE=new Set(['done','recovered','skipped','canceled']);
 function snapshot(rec){
   const data={};
-  for(const key of ['base','part','partStarts','startedAt','lastProgressAt','settings','mergedDurations','mergedSegStarts','mergedReplayOffsets','mergedFromParts','mergedInputs','mergeDestination','mergePlan','burnCheckpoint','uploadParts','processId','processingProcessId']){
+  for(const key of ['base','part','partStarts','startedAt','lastProgressAt','settings','mergedDurations','mergedSegStarts','mergedReplayOffsets','mergedFromParts','mergedInputs','mergedInputIdentities','mergeDestination','mergePlan','mergeFallbackExtension','remuxCheckpoints','burnCheckpoint','burnProofs','burnDirtyParts','uploadParts','uploadSplitWork','captureBackups','processId','processingProcessId']){
     if(rec[key]!==undefined)data[key]=structuredClone(rec[key]);
   }
   data.emptyParts=[...(rec.emptyParts||[])];data.issues=[...(rec.issues||[])];data.notices=[...(rec.notices||[])];
@@ -44,7 +44,7 @@ class JobStore{
 }
 function restoreRecorder(job,Recorder){
   const rec=new Recorder(job.base);const state=job.recorder||{};
-  for(const key of ['part','partStarts','startedAt','lastProgressAt','settings','mergedDurations','mergedSegStarts','mergedReplayOffsets','mergedFromParts','mergedInputs','mergeDestination','mergePlan','burnCheckpoint','uploadParts','processId'])if(state[key]!==undefined)rec[key]=structuredClone(state[key]);
+  for(const key of ['part','partStarts','startedAt','lastProgressAt','settings','mergedDurations','mergedSegStarts','mergedReplayOffsets','mergedFromParts','mergedInputs','mergedInputIdentities','mergeDestination','mergePlan','mergeFallbackExtension','remuxCheckpoints','burnCheckpoint','burnProofs','burnDirtyParts','uploadParts','uploadSplitWork','captureBackups','processId'])if(state[key]!==undefined)rec[key]=structuredClone(state[key]);
   rec.emptyParts=new Set((Array.isArray(state.emptyParts)?state.emptyParts:[]).filter(i=>Number.isInteger(i)&&i>0&&i<=rec.part));
   rec.issues=Array.isArray(state.issues)?state.issues.filter(e=>typeof e==='string'):[];rec.notices=Array.isArray(state.notices)?state.notices.filter(e=>typeof e==='string'):[];
   for(const key of ['mergedDurations','mergedSegStarts','mergedReplayOffsets','mergedInputs'])if(rec[key]!==undefined&&!Array.isArray(rec[key])){delete rec[key];rec.notices.push('部分恢复记录损坏，原始文件已保留，请检查恢复结果');}

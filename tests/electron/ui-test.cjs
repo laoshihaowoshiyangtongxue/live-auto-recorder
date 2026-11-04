@@ -73,10 +73,13 @@ app.whenReady().then(async()=>{
   return document.querySelector('.pi-pct').textContent==='63%'&&!document.querySelector('.pi-eta')&&document.querySelector('.pi-label').textContent==='已暂停'&&document.getElementById('postBadge').textContent.includes('已暂停');
  `);
  await check('postprocessing shows real percentage, stage ETA, unknown animation and clears stale estimates',`
-  window.auditState.post.items=[{id:'progress-test',name:'示例主播',status:'processing',stage:'恢复损坏画面',progress:{percent:42,remainingSec:120,updatedAt:Date.now()}}];
+  window.auditState.post.items=[{id:'progress-test',name:'测试主播',status:'processing',stage:'恢复损坏画面',progress:{percent:42,remainingSec:120,updatedAt:Date.now()}}];
   window.auditEmit();if(document.getElementById('postPanel').hidden)document.getElementById('postBadge').click();
   if(document.querySelector('.pi-pct').textContent!=='42%'||!document.querySelector('.pi-eta').textContent.includes('预计'))return false;
+  if(!document.querySelector('.pi-eta').textContent.includes('本阶段结束'))return false;
   if(document.querySelector('.pi-bar').getAttribute('aria-valuenow')!=='42')return false;
+  window.auditState.post.items[0].stage='校验分段 2/4';window.auditEmit();
+  if(document.querySelector('.pi-label').textContent!=='校验分段 2/4'||document.querySelector('.pi-label').title!=='校验分段 2/4')return false;
   window.auditState.post.items[0].progress=null;window.auditEmit();
   if(!document.querySelector('.pi-bar').classList.contains('indeterminate')||!document.querySelector('.pi-eta').textContent.includes('正在估算'))return false;
   window.auditState.post.items[0].progress={percent:80,remainingSec:20,updatedAt:Date.now()-30000};window.auditEmit();

@@ -1,4 +1,4 @@
-// 抖音会话管理：共享热身页（Cookie/指纹热）+ 页面内 fetch 轮询
+﻿// 抖音会话管理：共享热身页（Cookie/指纹热）+ 页面内 fetch 轮询
 // M0 结论: 冷启动直开房间页会被 ERR_FAILED 挡, 一切房间访问必须从热身页页面内跳转
 const { app, BrowserWindow, session } = require('electron');
 const log = require('../util/log');

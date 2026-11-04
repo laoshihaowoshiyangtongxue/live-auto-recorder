@@ -5,8 +5,9 @@ const {Recorder}=require('../src/core/recorder');
 test('mmco and decoder submission errors enter repair and preserve loss checks',async()=>{
  for(const message of ['r submitting packet to decoder: Invalid data found when processing input','[h264] mmco: unref short failure']){
   const rec=new Recorder(path.join(root,'repair'));const pending=rec.mp4Path(1)+'.pending.mp4';let scans=0;
+  rec._sizeOf=file=>file==='source.flv'?1000000:2048;
   rec._scanVideo=async file=>{scans++;return {packets:Array(file===pending?99:100),duration:10};};
-  rec._runFfmpeg=async()=>{fs.writeFileSync(pending,Buffer.alloc(2048));return {code:0,stderr:''};};
+  rec._runFfmpeg=async(args)=>{assert.ok(Number(args[args.indexOf('-b:v')+1])>0);assert.equal(args.includes('-cq'),false);fs.writeFileSync(pending,Buffer.alloc(2048));return {code:0,stderr:''};};
   rec.validateMedia=async()=>({ok:true});
   const result=await rec._recoverDecoded('source.flv',pending,message);
   assert.equal(result.kind,'decode');assert.equal(scans,2);assert.equal(result.missingFrames,1);

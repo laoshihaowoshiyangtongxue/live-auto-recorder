@@ -33,6 +33,9 @@ test('real FFmpeg emits progress without contaminating framehash or probes',asyn
     assert.ok(await rec._probeDuration(file)>1.5);
     result=await rec._runFfmpeg(['-v','error','-i',file,'-map','0:v:0','-c','copy','-f','framehash','-'],15000,true);
     assert.equal(result.code,0,result.stderr);assert.match(result.stdout,/#format: frame checksums/);assert.doesNotMatch(result.stdout,/progress=/);
+    values.length=0;let hashes='';
+    result=await rec._runFfmpeg(['-v','error','-i',file,'-map','0:v:0','-c','copy','-f','framehash','-'],15000,chunk=>hashes+=chunk.toString(),2);
+    assert.equal(result.code,0,result.stderr);assert.match(hashes,/#format: frame checksums/);assert.doesNotMatch(hashes,/progress=/);assert.ok(values.some(v=>v.percent>0));
     const checked=await rec.validateMedia(file);assert.equal(checked.ok,true,checked.stderr);
   } finally { fs.rmSync(dir,{recursive:true,force:true}); }
 });
